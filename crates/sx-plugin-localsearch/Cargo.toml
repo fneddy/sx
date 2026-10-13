@@ -1,0 +1,19 @@
+[package]
+name = "sx-plugin-localsearch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "LocalSearch/Tracker3 SPARQL handler for sx (localsearch:<query>)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sx-plugin-api = { workspace = true }
+stabby        = { workspace = true }
+gio           = { workspace = true }
+glib          = { workspace = true }
+log           = { workspace = true }
+env_logger    = { workspace = true }
+tracker       = { package = "tracker-rs", version = "0.8.0" }

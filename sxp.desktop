@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=sxp
+Comment=Universal query dispatch & launcher
+Exec=sxp
+Terminal=false
+StartupNotify=true
+StartupWMClass=sxp
+Categories=Utility;

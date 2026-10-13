@@ -1,0 +1,65 @@
+[package]
+name = "sxc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "sxc"
+path = "src/lib.rs"
+
+# ── Binaries ──────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "sxc"
+path = "src/tui/sxc.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "sxp"
+path = "src/gui/sxp.rs"
+required-features = ["gpui"]
+
+# ── Features ──────────────────────────────────────────────────────────────────
+
+[features]
+default = ["tui", "gpui"]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+]
+gpui = [
+    "dep:gpui",
+    "dep:gpui-kit",
+    "dep:gpui-component",
+    "dep:gio",
+    "dep:image",
+]
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+[dependencies]
+sx-core       = { workspace = true }
+sx-plugin-api = { workspace = true }
+tokio         = { workspace = true }
+tokio-util    = { workspace = true }
+futures-util  = { workspace = true }
+infer         = { workspace = true }
+log           = { workspace = true }
+env_logger    = { workspace = true }
+serde         = { workspace = true }
+toml          = { workspace = true }
+dirs-next     = "2.0"
+clap          = { version = "4.6.6", features = ["derive"] }
+open          = "5.4.2"
+
+# tui feature deps (optional)
+ratatui   = { version = "0.30", optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
+
+# gpui feature deps (optional)
+gpui           = { workspace = true, optional = true }
+gpui-kit       = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true }
+gio            = { workspace = true, optional = true }
+image          = { workspace = true, optional = true }

@@ -1,0 +1,12 @@
+[package]
+name = "sx-plugin-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+description = "Stable ABI contract for sx handler plugins"
+
+[dependencies]
+stabby = { workspace = true }
+
+[dev-dependencies]

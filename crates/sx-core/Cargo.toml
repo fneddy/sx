@@ -1,0 +1,50 @@
+[package]
+name = "sx-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+
+[dependencies]
+atomic_enum     = { workspace = true }
+sx-plugin-api   = { workspace = true }
+libloading      = { workspace = true }
+stabby          = { workspace = true }
+object          = { workspace = true }
+walkdir         = { workspace = true }
+thiserror       = { workspace = true }
+tokio           = { workspace = true }
+tokio-util      = { workspace = true }
+crossbeam-deque = { workspace = true }
+aho-corasick    = { workspace = true }
+async-stream    = { workspace = true }
+futures-core    = { workspace = true }
+flate2          = { workspace = true }
+xz2             = { workspace = true }
+bzip2-rs        = { workspace = true }
+ruzstd          = { workspace = true }
+epub            = { workspace = true }
+pdf_oxide       = { workspace = true }
+office_oxide    = { workspace = true }
+infer           = { workspace = true }
+time            = { workspace = true }
+winnow          = { workspace = true }
+strum           = { workspace = true }
+log             = { workspace = true }
+env_logger      = { workspace = true }
+memchr          = { workspace = true }
+memmap2         = { workspace = true }
+once_cell       = { workspace = true }
+uzers           = { workspace = true }
+shellexpand     = { workspace = true }
+
+[dev-dependencies]
+sx-plugin-calc   = { path = "../sx-plugin-calc" }
+sx-plugin-text   = { path = "../sx-plugin-text" }
+sx-plugin-pdf    = { path = "../sx-plugin-pdf" }
+sx-plugin-office = { path = "../sx-plugin-office" }
+sx-plugin-api    = { workspace = true }
+tokio            = { workspace = true }
+futures-util     = { workspace = true }
+tempfile         = "3.10.1"
+flate2           = { workspace = true }

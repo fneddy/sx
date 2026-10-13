@@ -1,0 +1,21 @@
+[package]
+name = "sx-plugin-apps"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Built-in application-search handler for sx (apps:<query>)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sx-plugin-api     = { workspace = true }
+stabby            = { workspace = true }
+gio               = { workspace = true }
+image             = { workspace = true }
+log               = { workspace = true }
+env_logger        = { workspace = true }
+freedesktop-icons = "0.4.0"
+resvg             = "0.44.0"
+tiny-skia         = "0.11.4"

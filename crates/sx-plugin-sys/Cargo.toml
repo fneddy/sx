@@ -1,0 +1,19 @@
+[package]
+name = "sx-plugin-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Built-in system-query handler for sx (sys:process, sys:port, sys:disk)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sx-plugin-api = { workspace = true }
+stabby        = { workspace = true }
+log           = { workspace = true }
+env_logger    = { workspace = true }
+sysinfo       = "0.39"
+libc          = "0.2"
+procfs        = "0.18.0"

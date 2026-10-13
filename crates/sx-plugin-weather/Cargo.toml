@@ -1,0 +1,18 @@
+[package]
+name = "sx-plugin-weather"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+description = "Built-in weather handler for sx (weather: namespace, open-meteo API)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sx-plugin-api       = { workspace = true }
+stabby              = { workspace = true }
+log                 = { workspace = true }
+env_logger          = { workspace = true }
+open-meteo-rs = "0.1.0"
+tokio         = { version = "1", features = ["rt"] }

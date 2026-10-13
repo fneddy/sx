@@ -1,0 +1,52 @@
+# sx configuration file
+#
+# Install to:  ~/.config/sx/config.toml
+#
+# The file is created automatically with default values on the first run if it
+# does not exist.  You only need to add the keys you want to change — every
+# section and key is optional and falls back to the default shown here.
+
+# ── Search ────────────────────────────────────────────────────────────────────
+
+[search]
+
+# Directories that are searched when --path is not given on the command line.
+# Falls back to the current working directory when the list is empty.
+#
+# directories = [
+#     "~/Documents",
+#     "~/Projects",
+# ]
+directories = []
+
+# ── TUI ───────────────────────────────────────────────────────────────────────
+
+[tui]
+
+# Redraw rate (frames per second) while results are still arriving.
+# Lower values reduce CPU usage during long searches.
+fps_searching = 20.0
+
+# Redraw rate once the search has finished or been cancelled.
+# Higher values make keyboard navigation feel more responsive.
+fps_done = 60.0
+
+# ── Theme ─────────────────────────────────────────────────────────────────────
+
+[theme]
+
+# Colour scheme used by the GUI (sxp).  Has no effect on the TUI (sxc).
+#
+# "dark"  — dark background, light text  (default)
+# "light" — light background, dark text
+mode = "dark"
+
+# ── GPU ───────────────────────────────────────────────────────────────────────
+
+[gpu]
+
+# Skip the Vulkan driver scan and use the OpenGL backend instead.
+#
+# Useful on systems where Vulkan is not available or causes problems.
+# When set to true the OpenGL backend is used unconditionally.
+force_gl = false

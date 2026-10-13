@@ -1,0 +1,91 @@
+[workspace]
+members = [
+    "crates/sx-plugin-api",
+    "crates/sx-core",
+    "crates/sx-plugin-calc",
+    "crates/sx-plugin-text",
+    "crates/sx-plugin-pdf",
+    "crates/sx-plugin-office",
+    "crates/sx-plugin-sys",
+    "crates/sx-plugin-weather",
+    "crates/sx-plugin-apps",
+    "crates/sx-plugin-localsearch",
+    "sxc",
+]
+resolver = "2"
+
+# ── Workspace-wide dependency versions ────────────────────────────────────────
+# All members that use these crates MUST reference them as
+#   foo.workspace = true
+# so version bumps only need to happen here.
+
+[workspace.dependencies]
+
+# gpui-pre 0.3.9 — the gpui backend used by gpui-kit 0.7.1
+gpui           = { package = "gpui-pre", version = "=0.3.9" }
+# gpui-kit (0.7.1) — UI component library built on gpui-pre
+gpui-kit       = { version = "0.7.1", features = ["component", "assets"] }
+gpui-component = { version = "0.7.1" }
+
+# Internal crates
+sx-plugin-api = { path = "crates/sx-plugin-api" }
+sx-core       = { path = "crates/sx-core" }
+
+# Stable ABI layer — superset features so every member can use .workspace = true
+stabby = { version = "72.1.16", features = ["libloading"] }
+
+# Logging (facade + impl)
+log        = "0.4"
+env_logger = "0.11"
+
+# Async runtime
+tokio        = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+atomic_enum  = "0.3"
+tokio-util   = { version = "0.7", features = ["rt"] }
+futures-core = "0.3"
+futures-util = "0.3"
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+# File-type detection (unified at latest)
+infer    = "0.22.0"
+once_cell = "1.21.4"
+
+# Image handling
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# GLib/GIO (GTK ecosystem)
+gio  = "0.22"
+glib = "0.22"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# Misc utilities shared across ≥ 2 members
+uzers           = "0.12"
+libloading      = "0.9"
+memmap2         = "0.9"
+thiserror       = "2.0"
+walkdir         = "2"
+rayon           = "1.12.0"
+memchr          = "2.8.3"
+aho-corasick    = "1"
+object          = { version = "0.40.0", features = ["read_core", "elf"] }
+crossbeam-deque = "0.8"
+async-stream    = "0.3"
+flate2          = "1.1"
+xz2             = "0.1"
+bzip2-rs        = "0.1"
+ruzstd          = "0.8"
+epub            = "2.1"
+pdf_oxide       = "0.3"
+office_oxide    = "=0.1.8"
+time            = { version = "0.3.41", features = ["parsing", "macros"] }
+winnow          = "1.0.4"
+strum           = { version = "0.28.0", features = ["derive"] }
+url             = "2.5.8"
+shellexpand     = { version = "3.1.2", features = ["full"] }
+
