@@ -15,7 +15,7 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use sx_core::{HandlerRegistry, Query};
+use sx_core::{HandlerRegistry, Query, QueryCompileExt, QueryRegistryExt};
 
 use sxc::shared::app::App;
 use sxc::shared::config::{resolve_roots, Tui as TuiConfig};
@@ -23,8 +23,6 @@ use sxc::shared::msg::{MetaValue, ResultMsg};
 use sxc::shared::registry::build_registry;
 use sxc::shared::search::{SearchHandle, SearchPhase};
 use sxc::shared::wire::{n_workers, wire_search};
-
-// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -51,8 +49,6 @@ struct Cli {
     #[arg(trailing_var_arg = true, num_args = 1.., value_name = "QUERY")]
     query_tokens: Vec<String>,
 }
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
@@ -132,29 +128,24 @@ async fn run_print(query: Query, registry: Arc<HandlerRegistry>) {
         } else if let Some(v) = r.meta("value") {
             println!("{}{}: {}", prefix, r.namespace, v);
         }
-        for e in &r.metadata {
-            match &e.value {
-                MetaValue::Text(v) => println!("  {}: {}", e.key, v),
-                MetaValue::Number(n) => println!("  {}: {}", e.key, n),
-                MetaValue::Bytes(b) => println!("  {}: <{} bytes>", e.key, b.len()),
+        for (k, v) in &r.metadata {
+            match v {
+                MetaValue::Text(s)   => println!("  {k}: {s}"),
+                MetaValue::Number(n) => println!("  {k}: {n}"),
+                MetaValue::Bytes(b)  => println!("  {k}: <{} bytes>", b.len()),
             }
         }
     }
 }
-
-// ── Rendering ─────────────────────────────────────────────────────────────────
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const HIGHLIGHT: Style = Style::new()
     .bg(Color::DarkGray)
     .add_modifier(Modifier::BOLD);
 
-/// Returns the number of visible result rows for a terminal of `total_height` rows.
-///
-/// The layout reserves the bottom half of the terminal for a future input area,
-/// and 2 rows are consumed by the results-block border.
+/// Visible result rows for a terminal of `total_height` rows.
+/// Upper half of the terminal minus the 2-row block border.
 fn visible_rows(total_height: u16) -> usize {
-    // Upper half (minus footer row), then subtract the 2-row block border.
     total_height
         .saturating_sub(1)
         .checked_div(2)
@@ -162,10 +153,7 @@ fn visible_rows(total_height: u16) -> usize {
         .saturating_sub(2) as usize
 }
 
-/// Build one result row as a `Line<'static>`.
-///
-/// All spans own their string data (via `format!` / `.clone()`) so the returned
-/// `Line` is `'static` — required by ratatui's widget rendering model.
+/// Build one result row as a `'static` `Line` (ratatui widget requirement).
 fn result_line(r: &ResultMsg, selected: bool) -> Line<'static> {
     use sxc::shared::icon::symbol_for_result;
     let marker = if selected { "▶" } else { " " };
@@ -183,11 +171,11 @@ fn result_line(r: &ResultMsg, selected: bool) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         (None, None) => {
-            if let Some(e) = r.metadata.first() {
-                match &e.value {
-                    MetaValue::Text(v) => Span::raw(format!("{}: {}", e.key, v)),
-                    MetaValue::Number(n) => Span::raw(format!("{}: {}", e.key, n)),
-                    MetaValue::Bytes(b) => Span::raw(format!("{}: <{} bytes>", e.key, b.len())),
+            if let Some((k, v)) = r.metadata.iter().next() {
+                match v {
+                    MetaValue::Text(s)   => Span::raw(format!("{k}: {s}")),
+                    MetaValue::Number(n) => Span::raw(format!("{k}: {n}")),
+                    MetaValue::Bytes(b)  => Span::raw(format!("{k}: <{} bytes>", b.len())),
                 }
             } else {
                 Span::raw(String::new())
@@ -229,7 +217,7 @@ fn render(app: &App, phase: SearchPhase, selected: usize, scroll: usize, frame: 
             Span::styled("Enter", key),
             Span::raw(" open  "),
             Span::styled("q/Esc", key),
-            Span::raw(" quit"),
+            Span::raw(" stop/quit"),
         ])),
         footer_area,
     );
@@ -262,8 +250,6 @@ fn clamp_scroll(selected: usize, scroll: usize, visible: usize) -> usize {
         scroll
     }
 }
-
-// ── TUI loop state ────────────────────────────────────────────────────────────
 
 struct TuiState {
     app: App,
@@ -325,8 +311,6 @@ impl TuiState {
     }
 }
 
-// ── main loop ─────────────────────────────────────────────────────────────────
-
 async fn run_tui(
     mut terminal: DefaultTerminal,
     mut rx: mpsc::UnboundedReceiver<ResultMsg>,
@@ -366,12 +350,9 @@ async fn run_tui(
                         let last = s.app.results.len().saturating_sub(1);
                         s.selected = s.selected.min(last);
                         match (key.code, key.modifiers) {
-                            // Ctrl+C always quits immediately.
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => break None,
 
-                            // q / Esc — identical two-step exit:
-                            //   press 1: stop the search if still running; arm the quit flag.
-                            //   press 2: always exit, regardless of what press 1 did.
+                            // q / Esc: first press stops and arms; second press exits.
                             (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                                 if s.quit_armed {
                                     break None;

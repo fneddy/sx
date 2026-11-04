@@ -1,7 +1,7 @@
 //! Compiled walk-tier and content-tier filters.
 //!
 //! [`CompiledWalkFilter`] and [`CompiledContentFilter`] are built once per
-//! query from the respective [`crate::query::Filter`] sub-trees.  All
+//! query from the respective [`Filter`] sub-trees.  All
 //! AhoCorasick automata and hash sets are constructed at compile time; the
 //! hot-path `matches()` calls do no allocation and no construction.
 
@@ -9,7 +9,7 @@ use log::{debug, trace};
 #[cfg(unix)]
 use uzers::{get_group_by_gid, get_user_by_uid};
 
-use crate::query::{
+use sx_parser::{
     CaseSensitivity, FileType, Filter, HiddenMode, MatchExpr, MetaFilter, RangeExpr, SearchOptions,
     Timestamp,
 };
@@ -21,18 +21,12 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-// ── Internal match helpers ────────────────────────────────────────────────────
-
-/// Compiled form of a single `MatchExpr`.
-///
-/// Uses `memchr::memmem::Finder` rather than `AhoCorasick` — cheaper to
-/// construct and faster to search for a single pattern.  `AhoCorasick` is
-/// reserved for the content tier where many patterns are scanned in one pass.
+/// Compiled form of a single `MatchExpr`. Uses `memmem::Finder` — cheaper to
+/// construct than `AhoCorasick` and sufficient for a single pattern.
 struct CompiledMatch {
     finder: memmem::Finder<'static>,
     negated: bool,
-    /// Whether the finder needle was lowercased for case-insensitive matching.
-    /// Stored so `matches_bytes` knows when to lowercase the haystack too.
+    /// `true` when the needle was lowercased; `matches_bytes` will lowercase the haystack too.
     insensitive: bool,
 }
 
@@ -77,7 +71,6 @@ enum AcCase {
     Insensitive,
 }
 
-/// Internal recursive filter node.
 enum FilterNode {
     Any,
     Name(CompiledMatch),
@@ -152,8 +145,7 @@ impl FilterNode {
         }
     }
 
-    /// Returns `true` when this node can meaningfully prune a directory.
-    /// Only used by the `Not` arm of `dir_passes`.
+    /// `true` when this node can prune a directory (used by the `Not` arm of `dir_passes`).
     fn is_dir_predicate(&self) -> bool {
         match self {
             Self::Hidden(_) => true,
@@ -167,9 +159,8 @@ impl FilterNode {
         }
     }
 
-    /// Returns `false` when a negated Name/Path/Hidden predicate definitively
-    /// excludes a directory.  All other leaves return `true` — they must not
-    /// prune directories.
+    /// `false` when a negated Name/Path/Hidden predicate excludes a directory.
+    /// All other leaves return `true` and must not prune directories.
     fn dir_passes(&self, entry: &walkdir::DirEntry) -> bool {
         match self {
             Self::Any => true,
@@ -190,7 +181,7 @@ impl FilterNode {
                 }
             }
             Self::Hidden(mode) => {
-                let is_hidden = entry.file_name().as_encoded_bytes().first().copied() == Some(b'.');
+                let is_hidden = entry.file_name().as_encoded_bytes().starts_with(b".");
                 match mode {
                     HiddenMode::Include => true,
                     HiddenMode::Exclude => !is_hidden,
@@ -252,7 +243,7 @@ impl FilterNode {
             }
 
             Self::Hidden(mode) => {
-                let is_hidden = entry.file_name().as_encoded_bytes().first().copied() == Some(b'.');
+                let is_hidden = entry.file_name().as_encoded_bytes().starts_with(b".");
                 match mode {
                     HiddenMode::Include => true,
                     HiddenMode::Exclude => !is_hidden,
@@ -267,13 +258,7 @@ impl FilterNode {
                     .extension()
                     .map(|e| e.as_encoded_bytes())
                     .unwrap_or_default();
-                set.iter().any(|stored| {
-                    stored.len() == raw_ext.len()
-                        && stored
-                            .iter()
-                            .zip(raw_ext.iter())
-                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                })
+                set.iter().any(|stored| stored.eq_ignore_ascii_case(raw_ext))
             }
 
             Self::Size(range) => {
@@ -425,38 +410,28 @@ impl FilterNode {
 }
 
 impl CompiledWalkFilter {
-    /// Build a `CompiledWalkFilter` from a `Filter` subtree.
-    ///
-    /// Should be called on `Query::walk_filter`.  Content-tier leaves that
-    /// appear here are compiled to pass-through (always true) — they will be
-    /// re-evaluated by the content-tier filter.
+    /// Build from a `Filter` subtree (call with `Query::walk_filter`).
+    /// Content-tier leaves compile to pass-through; they are re-evaluated at content time.
     pub fn from_filter(f: &Filter) -> Self {
         Self(FilterNode::from_filter(f, AcCase::Sensitive))
     }
 
-    /// Same as [`from_filter`] but honours `CaseSensitivity` for the given
-    /// representative pattern bytes (used by the walk engine).
+    /// Like [`from_filter`] but honours `CaseSensitivity` against a representative pattern.
     pub fn from_filter_case(f: &Filter, case: &CaseSensitivity, pattern: &[u8]) -> Self {
         let ac_case = resolve_case(case, pattern.iter().copied());
         Self(FilterNode::from_filter(f, ac_case))
     }
 
-    /// Evaluate the compiled filter against a [`walkdir::DirEntry`].
-    ///
-    /// Returns `true` if the entry satisfies the filter.
+    /// `true` if the entry satisfies the filter.
     pub fn matches(&self, entry: &walkdir::DirEntry) -> bool {
         self.0.matches(entry)
     }
 
-    /// Returns `false` if a Path/Name predicate definitively excludes this
-    /// directory — used to prune before descent.  File-only leaves never
-    /// cause a directory to be pruned.
+    /// `false` if a Path/Name predicate definitively excludes this directory (prune before descent).
     pub(crate) fn dir_passes(&self, entry: &walkdir::DirEntry) -> bool {
         self.0.dir_passes(entry)
     }
 }
-
-// ── Range helpers ─────────────────────────────────────────────────────────────
 
 fn range_matches_u64(range: &RangeExpr<u64>, value: u64) -> bool {
     match range {
@@ -485,8 +460,7 @@ fn system_time_to_timestamp(st: std::time::SystemTime) -> Timestamp {
     Timestamp(nanos.min(u64::MAX as u128) as u64)
 }
 
-/// Resolve `CaseSensitivity::Smart` against pattern bytes.
-/// Returns `Insensitive` when every byte is lowercase or non-alpha, `Sensitive` otherwise.
+/// Smart case: `Insensitive` if all bytes are lowercase/non-alpha, `Sensitive` otherwise.
 fn resolve_case(case: &CaseSensitivity, bytes: impl IntoIterator<Item = u8>) -> AcCase {
     match case {
         CaseSensitivity::Sensitive => AcCase::Sensitive,
@@ -546,8 +520,8 @@ impl CompiledContentFilter {
 
         let ac_case = resolve_case(&opts.case, ac_values.iter().flat_map(|v| v.iter()).copied());
 
-        // MatchKind::Standard reports all overlapping matches; LeftmostFirst
-        // would silently skip patterns sharing a start position.
+        // MatchKind::Standard reports all overlapping matches; LeftmostFirst silently
+        // skips patterns sharing a start position.
         let ac_patterns: Vec<&[u8]> = ac_values.iter().map(|v| v.as_ref()).collect();
         let ac = if ac_patterns.is_empty() {
             None
@@ -555,7 +529,7 @@ impl CompiledContentFilter {
             Some(
                 AhoCorasickBuilder::new()
                     .ascii_case_insensitive(ac_case == AcCase::Insensitive)
-                    .match_kind(MatchKind::Standard) // must be Standard for overlapping
+                    .match_kind(MatchKind::Standard)
                     .build(ac_patterns)
                     .expect("AhoCorasick build never fails for non-empty pattern list"),
             )
@@ -569,19 +543,17 @@ impl CompiledContentFilter {
         }
     }
 
-    /// Build with default settings. Convenience for tests.
+    /// Convenience wrapper with default settings (tests).
     pub fn from_filter(f: &Filter) -> Self {
         Self::from_filter_opts(f, &SearchOptions::default())
     }
 
-    /// `true` when the filter is `Filter::Any` — no file content needs to be read.
+    /// `true` when the filter is `Filter::Any` — skip all file reads.
     pub fn is_trivially_true(&self) -> bool {
         matches!(self.root, ContentNode::Any)
     }
 
-    /// Returns `(matched, hit_count)` for the extracted `content` of `path`.
-    ///
-    /// `scratch` is reused across calls to avoid a per-file allocation.
+    /// Returns `(matched, hit_count)` for `content`. `scratch` is reused to avoid per-call allocation.
     pub fn matches(&self, path: &Path, content: &[u8], scratch: &mut Vec<bool>) -> (bool, usize) {
         let n = self.patterns.len();
         scratch.clear();
@@ -707,13 +679,9 @@ fn build_content_node(
     }
 }
 
-/// Lowercase `bytes` into a fixed 512-byte stack buffer (no heap allocation
-/// for the common case) and pass the result to `f`.  Inputs longer than 512
-/// bytes fall back to a `Vec` allocation.
+/// Lowercase `bytes` into a 512-byte stack buffer, falling back to heap for longer inputs.
 #[inline]
 fn with_lowercase<R>(bytes: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
-    // 512 bytes covers the vast majority of file names and source-code lines
-    // with zero heap allocation; only unusually long inputs allocate.
     if bytes.len() <= 512 {
         let mut buf = [0u8; 512];
         let lower = &mut buf[..bytes.len()];
@@ -735,7 +703,7 @@ fn line_contains(finder: &memmem::Finder<'_>, line: &[u8], insensitive: bool) ->
     }
 }
 
-/// Returns whether any line in `content` satisfies the `Line` pattern.
+/// `true` when any line in `content` satisfies `pat`.
 fn line_pattern_hits(pat: &SubstringPattern, content: &[u8], insensitive: bool) -> bool {
     let finder = match &pat.line_finder {
         Some(f) => f,
@@ -873,7 +841,7 @@ fn eval_content_node(
 
 use crate::error::SxError;
 use crate::extract::extractor_for;
-use crate::query::Query;
+use sx_parser::Query;
 use atomic_enum::atomic_enum;
 use crossbeam_deque::{Injector, Steal};
 use futures_core::Stream;
@@ -883,18 +851,6 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
-
-/// Directories skipped unconditionally when `HiddenMode::Exclude` is active.
-static ARTIFACT_DIRS_UNCONDITIONAL: &[&str] = &[
-    "node_modules",
-    "__pycache__",
-    "cmake-build-debug",
-    "cmake-build-release",
-    "DerivedData",
-    "_build",
-    "$RECYCLE.BIN",
-    "System Volume Information",
-];
 
 /// Directories skipped only when a marker file exists in the parent directory.
 /// Each entry is `(dir_name, &[marker_files])`; an empty marker list means always skip.
@@ -922,7 +878,17 @@ fn is_artifact_dir(entry: &walkdir::DirEntry) -> bool {
         Err(_) => return false,
     };
 
-    if ARTIFACT_DIRS_UNCONDITIONAL.contains(&name) {
+    if matches!(
+        name,
+        "node_modules"
+            | "__pycache__"
+            | "cmake-build-debug"
+            | "cmake-build-release"
+            | "DerivedData"
+            | "_build"
+            | "$RECYCLE.BIN"
+            | "System Volume Information"
+    ) {
         return true;
     }
 
@@ -963,11 +929,9 @@ fn is_artifact_dir(entry: &walkdir::DirEntry) -> bool {
 #[derive(Debug, Clone)]
 pub struct Match {
     pub path: PathBuf,
-    /// `Err` when extraction failed but the path passed walk filters — surfaced
-    /// so callers can report it rather than silently dropping the entry.
+    /// `Err` when extraction failed; surfaced so callers can report it.
     pub extracted: Result<(), SxError>,
-    /// Relevance score in `[0.0, 1.0)` derived from `n / (n + 1)` where `n` is
-    /// the raw AhoCorasick hit count.  `0.0` for walk-only matches.
+    /// Relevance score in `[0.0, 1.0)` via `n / (n + 1)` where `n` = AhoCorasick hit count.
     pub score: f64,
     pub content: Option<Vec<u8>>,
 }
@@ -982,28 +946,25 @@ fn normalise_score(raw: usize) -> f64 {
 }
 
 /// Ready-to-execute form of a [`Query`]. Cheap to clone — all inner state is `Arc`.
-///
-/// Clone across worker tasks; whichever is polled first becomes the walker.
-/// A `CompiledQuery` is single-use; call [`Query::compile_with_registry`] for a new search.
+/// The first worker task polled atomically claims the walker role; others steal work.
+/// Single-use: call [`Query::compile_with_registry`] to start a new search.
 #[derive(Clone)]
 pub struct CompiledQuery {
     pub roots: Vec<PathBuf>,
     pub options: SearchOptions,
     pub walk: Arc<CompiledWalkFilter>,
-    /// `None` when `content_filter` was `Filter::Any` — workers skip extraction.
+    /// `None` means `Filter::Any` — skip extraction entirely.
     pub content: Option<Arc<CompiledContentFilter>>,
     hidden_mode: HiddenMode,
     work: Arc<WorkState>,
-    pub handler_tokens: Vec<crate::query::HandlerToken>,
-    /// `None` when compiled without a registry (falls back to built-in extractors).
-    ///
-    /// # Drop-order invariant
-    /// `file_handlers` MUST be declared before `registry`. Rust drops struct
-    /// fields in declaration order, so this ensures every `Arc<dyn SxHandler>`
-    /// clone held here is released *before* the registry drops its
-    /// `owned_plugins` (which calls `dlclose`). Dropping `registry` first would
-    /// unload the `.so` while `StabbyHandlerWrapper::drop` still needs to call
-    /// through the plugin vtable → SIGSEGV.
+    pub handler_tokens: Vec<sx_parser::HandlerToken>,
+    /// Verbatim query string — passed through to `SxQueryContext.raw_query` so
+    /// file-index plugins can extract filter tokens themselves.
+    pub raw_query: String,
+    // Drop-order invariant: file_handlers MUST be declared before registry.
+    // Rust drops fields in declaration order, so handler Arc clones are released
+    // before registry drops owned_plugins (dlclose). Reversing the order would
+    // unload the .so while StabbyHandlerWrapper::drop still calls through the vtable.
     file_handlers: Option<Arc<Vec<Arc<dyn sx_plugin_api::SxHandler>>>>,
     pub registry: Option<Arc<crate::handler_registry::HandlerRegistry>>,
     /// `false` for pure handler queries (e.g. `"calc:pi^2"`) — skips the file walk.
@@ -1013,11 +974,6 @@ pub struct CompiledQuery {
 /// Phase of the walker within one [`CompiledQuery::run`] call-group.
 ///
 /// Transitions are one-way: `Unclaimed → Walking → Done`.
-///
-/// [`#[atomic_enum]`](atomic_enum::atomic_enum) generates `AtomicWalkPhase`,
-/// replacing the old `walker_claimed: AtomicBool` + `walking_done: AtomicBool`
-/// pair with a single typed atomic field.  All `as u8` casts and the manual
-/// `WalkPhase::load()` helper are gone.
 #[atomic_enum]
 #[derive(PartialEq)]
 enum WalkPhase {
@@ -1038,21 +994,14 @@ struct WorkState {
     /// increment always precedes the push.
     in_flight: AtomicUsize,
     /// Combined walker-election + completion flag.
-    ///
-    /// Replaces the old `walker_claimed: AtomicBool` + `walking_done: AtomicBool`
-    /// pair: those two fields were always two halves of the same one-way state
-    /// machine, so one typed `AtomicWalkPhase` (generated by `#[atomic_enum]`)
-    /// is clearer and requires no manual `as u8` casts.
     walk_phase: AtomicWalkPhase,
     /// Drives cooperative cancellation for all workers on this query.
     ///
-    /// Replaces the old `cancelled: AtomicBool`:
-    /// - Workers wait in a `tokio::select!` that races `work_available`
-    ///   against `token.cancelled()`, so no manual `notify_waiters()` is
-    ///   needed on cancellation.
-    /// - Outer tasks wrap their stream-consuming loop with
-    ///   `token.run_until_cancelled(...)`, removing explicit `is_cancelled()`
-    ///   poll-checks from every loop iteration.
+    /// Workers wait in a `tokio::select!` that races `work_available`
+    /// against `token.cancelled()`, so no explicit `notify_waiters()` call
+    /// is needed on cancellation.  Outer tasks wrap their stream-consuming
+    /// loop with `token.run_until_cancelled(...)` so cancellation exits at
+    /// the next `await` point without per-iteration `is_cancelled()` checks.
     token: CancellationToken,
     /// Notified when a path is pushed to `injector` or when walking completes.
     work_available: Notify,
@@ -1071,15 +1020,10 @@ impl WorkState {
 }
 
 impl CompiledQuery {
-    /// Returns a lightweight clone of this query's [`CancellationToken`].
+    /// Clone of the cancellation token for this query.
     ///
-    /// Callers should wrap it in a [`DropGuard`] (`token().drop_guard()`) so
-    /// that cancellation is driven by ownership rather than explicit calls.
-    /// Pass individual clones to `spawn_blocking` handler tasks so they can
-    /// check [`CancellationToken::is_cancelled`] without holding a full
-    /// `CompiledQuery` clone.
-    ///
-    /// [`DropGuard`]: tokio_util::sync::DropGuard
+    /// Wrap in `token().drop_guard()` to drive cancellation by ownership.
+    /// Pass clones to `spawn_blocking` tasks that need `is_cancelled()`.
     pub fn token(&self) -> CancellationToken {
         self.work.token.clone()
     }
@@ -1113,9 +1057,8 @@ impl CompiledQuery {
                 let output = handle.extract(path_bytes);
                 let decision: Option<Option<Match>> = output.match_owned(
                     |sx_bytes| {
-                        // Probe extracted bytes, not the raw file: document plugins
-                        // extract null-free text from containers (PDF/DOCX/ZIP) that
-                        // themselves contain null bytes.
+                        // Use extracted bytes: document plugins strip null bytes
+                        // that their container formats (PDF/DOCX/ZIP) may contain.
                         if !self.options.include_binary_content
                             && sx_bytes.as_bytes().contains(&b'\0')
                         {
@@ -1137,8 +1080,7 @@ impl CompiledQuery {
                             Some(None)
                         }
                     },
-                    // `None` means this handler did not claim the file; fall through to the next.
-                    |_skip| None,
+                    |_skip| None, // None = handler did not claim this file
                     |msg| {
                         let err_str = msg.into_string();
                         debug!("file_matches '{}': plugin extraction error: {}", path.display(), err_str);
@@ -1255,8 +1197,7 @@ impl CompiledQuery {
             let mut scratch: Vec<bool> = Vec::new();
 
             if !self.has_file_terms {
-                // No file walk — jump straight to Done so content workers can
-                // observe the termination condition immediately.
+                // No file walk — mark Done immediately.
                 self.work
                     .walk_phase
                     .store(WalkPhase::Done, Ordering::Release);
@@ -1276,8 +1217,7 @@ impl CompiledQuery {
                 .is_ok();
 
             if is_walker && self.has_file_terms {
-                // Transitions walk_phase to Done even if the stream is dropped
-                // mid-walk (cancellation, channel close, etc.).
+                // Ensures walk_phase reaches Done even on early drop (cancellation, channel close).
                 struct WalkingDoneGuard<'a>(&'a AtomicWalkPhase, &'a Notify);
                 impl Drop for WalkingDoneGuard<'_> {
                     fn drop(&mut self) {
@@ -1304,9 +1244,7 @@ impl CompiledQuery {
                         .into_iter()
                         .filter_entry(move |e| {
                             if e.file_type().is_dir() {
-                                // Never prune the root itself — depth 0 is the
-                                // search root supplied by the caller, not a
-                                // candidate to filter.
+                                // Never prune depth-0; it's the search root.
                                 if e.depth() == 0 {
                                     return true;
                                 }
@@ -1358,9 +1296,8 @@ impl CompiledQuery {
                 }
                 match self.work.injector.steal() {
                     Steal::Success(path) => {
-                        // Release so the walker's prior `fetch_add` (Relaxed) and
-                        // any writes done in this task are visible to the
-                        // termination check below.
+                        // Release: makes the walker's prior Relaxed fetch_add visible
+                        // to the termination check (Done && in_flight == 0).
                         self.work.in_flight.fetch_sub(1, Ordering::Release);
                         let result = tokio::task::block_in_place(|| {
                             self.file_matches_with_handles(&path, &mut handles, &mut scratch)
@@ -1381,9 +1318,8 @@ impl CompiledQuery {
                         break;
                     }
                     Steal::Empty => {
-                        // Race new-work notification against cancellation so
-                        // workers wake immediately on cancel without a separate
-                        // `notify_waiters()` call in `cancel()`.
+                        // Race work-available against cancellation so workers
+                        // wake immediately on cancel.
                         tokio::select! {
                             _ = self.work.work_available.notified() => {}
                             _ = self.work.token.cancelled() => break,
@@ -1396,14 +1332,24 @@ impl CompiledQuery {
     }
 }
 
-impl Query {
-    /// Compile into the ready-to-execute form, building all automata once.
-    pub fn compile(self) -> CompiledQuery {
+/// Extension methods on [`Query`] to produce a [`CompiledQuery`].
+pub trait QueryCompileExt {
+    /// Compile, building all automata once.
+    fn compile(self) -> CompiledQuery;
+
+    /// Compile with a [`HandlerRegistry`] for non-file token dispatch.
+    fn compile_with_registry(
+        self,
+        registry: Option<Arc<crate::handler_registry::HandlerRegistry>>,
+    ) -> CompiledQuery;
+}
+
+impl QueryCompileExt for Query {
+    fn compile(self) -> CompiledQuery {
         self.compile_with_registry(None)
     }
 
-    /// Compile, attaching a [`HandlerRegistry`] for non-file token dispatch.
-    pub fn compile_with_registry(
+    fn compile_with_registry(
         self,
         registry: Option<Arc<crate::handler_registry::HandlerRegistry>>,
     ) -> CompiledQuery {
@@ -1414,7 +1360,7 @@ impl Query {
             || self.content_filter != Filter::Any
             || self.handler_tokens.is_empty();
 
-        // Inject an Ext allow-list from handler defaults when no explicit ext: filter was given.
+        // Inject handler default extensions when no explicit ext: filter is present.
         let walk_filter = if let Some(ref reg) = registry {
             let defaults = reg.default_file_extensions();
             if has_file_terms && !defaults.is_empty() && !filter_has_ext(&self.walk_filter) {
@@ -1460,6 +1406,7 @@ impl Query {
             hidden_mode,
             work: Arc::new(WorkState::new()),
             handler_tokens: self.handler_tokens,
+            raw_query: self.raw_query,
             registry,
             file_handlers,
             has_file_terms,
@@ -1487,8 +1434,7 @@ fn filter_has_ext(f: &Filter) -> bool {
     match f {
         Filter::Ext(_) => true,
         Filter::And(children) | Filter::Or(children) => children.iter().any(filter_has_ext),
-        // A negated extension filter excludes extensions; it does not positively
-        // select one, so it must not suppress the automatic allow-list injection.
+        // Not(Ext) excludes extensions, it doesn't positively select — don't treat as explicit.
         Filter::Not(_) => false,
         _ => false,
     }

@@ -16,7 +16,7 @@
 
 use exmex::{Express, FlatEx, FloatOpsFactory, MakeOperators, Operator};
 use sx_plugin_api::{
-    meta_text, stabby, SxBytes, SxHandlerInfo, SxNamespacePolicy, SxQueryContext, SxResult,
+    stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext, SxResult,
     SxResultSender,
 };
 
@@ -47,6 +47,7 @@ impl sx_plugin_api::SxHandler for CalcHandler {
             file_extensions_optional: stabby::vec::Vec::new(),
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: false,
+            is_file_index: false,
         }
     }
 
@@ -61,7 +62,7 @@ impl sx_plugin_api::SxHandler for CalcHandler {
         let result_str = evaluate(expr);
         log::debug!("calc: result = {:?}", result_str);
         let mut result = SxResult::new("calc", 1.0);
-        meta_text(&mut result, "value", &result_str);
+        result.metadata.push(SxMetaEntry::text("value", &result_str));
         sender.send(result);
     }
 

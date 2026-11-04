@@ -1,0 +1,15 @@
+[package]
+name = "sx-parser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Query language parser for sx — shared by sx-core and file-index plugins"
+
+[dependencies]
+winnow    = { workspace = true }
+strum     = { workspace = true }
+log       = { workspace = true }
+time      = { workspace = true }
+thiserror = { workspace = true }
+shellexpand = { workspace = true }

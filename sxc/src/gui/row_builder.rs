@@ -33,12 +33,7 @@ impl SortKey {
     pub fn cmp(&self, other: &Self) -> Ordering {
         self.section
             .cmp(&other.section)
-            .then_with(|| {
-                other
-                    .score
-                    .partial_cmp(&self.score)
-                    .unwrap_or(Ordering::Equal)
-            })
+            .then_with(|| other.score.total_cmp(&self.score))
             .then_with(|| self.title_len.cmp(&other.title_len))
     }
 }
@@ -60,12 +55,23 @@ fn row_action(r: &ResultMsg) -> Option<ActionKind> {
     None
 }
 
+/// Format a metadata entry as `"key: value"`, or `None` for `Bytes`.
+///
+/// Central definition — used by both [`metadata_summary`] and [`make_row`].
+fn meta_entry_display(key: &str, value: &crate::shared::msg::MetaValue) -> Option<String> {
+    use crate::shared::msg::MetaValue;
+    match value {
+        MetaValue::Text(v)   => Some(format!("{key}: {v}")),
+        MetaValue::Number(n) => Some(format!("{key}: {n}")),
+        MetaValue::Bytes(_)  => None,
+    }
+}
+
 /// Build a short human-readable summary string from a result's metadata.
 ///
 /// Weather results get a formatted line like "partly cloudy · 18.5°C · 12 km/h".
 /// Other results fall back to the first metadata key/value pair.
 fn metadata_summary(r: &ResultMsg) -> Option<String> {
-    use crate::shared::msg::MetaValue;
     // Weather: condition + temp + windspeed
     if let Some(cond) = r.meta("condition") {
         let mut s = cond.to_owned();
@@ -80,12 +86,8 @@ fn metadata_summary(r: &ResultMsg) -> Option<String> {
     // Generic fallback: first Text entry that isn't icon_symbol
     r.metadata
         .iter()
-        .find(|e| e.key != "icon_symbol")
-        .and_then(|e| match &e.value {
-            MetaValue::Text(v) => Some(format!("{}: {}", e.key, v)),
-            MetaValue::Number(n) => Some(format!("{}: {}", e.key, n)),
-            MetaValue::Bytes(_) => None,
-        })
+        .filter(|(k, _)| *k != "icon_symbol")
+        .find_map(|(k, v)| meta_entry_display(k, v))
 }
 
 /// Decode raw PNG bytes into a `RenderImage` (BGRA frames) for GPUI rendering.
@@ -111,7 +113,6 @@ fn png_to_render_image(png: &[u8]) -> Option<Arc<RenderImage>> {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn make_row(r: &ResultMsg) -> RowData {
-    use crate::shared::msg::MetaValue;
     let raw_label: String = r
         .title
         .clone()
@@ -119,11 +120,7 @@ pub fn make_row(r: &ResultMsg) -> RowData {
         .unwrap_or_else(|| {
             r.metadata
                 .iter()
-                .find_map(|e| match &e.value {
-                    MetaValue::Text(v) => Some(format!("{}: {}", e.key, v)),
-                    MetaValue::Number(n) => Some(format!("{}: {}", e.key, n)),
-                    MetaValue::Bytes(_) => None,
-                })
+                .find_map(|(k, v)| meta_entry_display(k, v))
                 .unwrap_or_default()
         });
 

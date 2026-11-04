@@ -7785,6 +7785,7 @@ dependencies = [
  "shellexpand",
  "stabby",
  "strum",
+ "sx-parser",
  "sx-plugin-api",
  "sx-plugin-calc",
  "sx-plugin-office",
@@ -7799,6 +7800,18 @@ dependencies = [
  "walkdir",
  "winnow 1.0.4",
  "xz2",
+]
+
+[[package]]
+name = "sx-parser"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "shellexpand",
+ "strum",
+ "thiserror 2.0.21",
+ "time",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -7844,6 +7857,7 @@ dependencies = [
  "glib",
  "log",
  "stabby",
+ "sx-parser",
  "sx-plugin-api",
  "tracker-rs",
 ]

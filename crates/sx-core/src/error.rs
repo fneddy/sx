@@ -1,22 +1,8 @@
 /// Errors produced by `Query::from_str` / `Query::from_str_with_roots`.
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum ParseError {
-    #[error("unknown namespace `{token}`")]
-    UnknownNamespace { token: String },
-
-    #[error("invalid value `{value}` for namespace `{namespace}`: {reason}")]
-    InvalidValue {
-        namespace: String,
-        value: String,
-        reason: String,
-    },
-
-    #[error("malformed combinator: `{raw}`")]
-    MalformedCombinator { raw: String },
-
-    #[error("empty query")]
-    EmptyQuery,
-}
+///
+/// Re-exported from `sx-parser` so callers of `sx-core` don't need to depend
+/// on `sx-parser` directly.
+pub use sx_parser::ParseError;
 
 /// Errors produced by `QueryBuilder::build()`.
 #[derive(Debug, thiserror::Error, PartialEq)]

@@ -19,7 +19,7 @@ use open_meteo_rs::{
     Client, Location,
 };
 use sx_plugin_api::{
-    meta_text, stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext,
+    stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext,
     SxResult, SxResultSender,
 };
 
@@ -224,7 +224,7 @@ impl WeatherHandler {
             metadata: entries,
             ..SxResult::new("weather", 1.0)
         };
-        meta_text(&mut result, "icon_symbol", wmo_emoji(code, is_day));
+        result.metadata.push(SxMetaEntry::text("icon_symbol", wmo_emoji(code, is_day)));
 
         sender.send(result);
     }
@@ -250,6 +250,7 @@ impl sx_plugin_api::SxHandler for WeatherHandler {
             file_extensions_optional: stabby::vec::Vec::new(),
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: false,
+            is_file_index: false,
         }
     }
 

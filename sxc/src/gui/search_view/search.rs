@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use gpui::{App, Context};
-use sx_core::Query;
+use sx_core::{Query, QueryCompileExt, QueryRegistryExt};
 use sx_plugin_api::{SxCaseSensitivity, SxQueryContext, SxResult, SxResultSender};
 
 use crate::shared::msg::ResultMsg;
@@ -44,6 +44,27 @@ impl StatusBar {
     /// `true` while search workers are still running (drives the spinner).
     pub(super) fn is_running(&self) -> bool {
         matches!(self, Self::Searching(_))
+    }
+
+    /// `true` when there is at least one result to show in the list.
+    pub(super) fn has_results(&self) -> bool {
+        match self {
+            Self::Searching(n) | Self::Done(n) => *n > 0,
+            _ => false,
+        }
+    }
+
+    /// `true` when the quick-reference panel should be shown.
+    /// This happens only in the `Hidden` state — no query, no results.
+    pub(super) fn shows_quick_ref(&self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+
+    /// `true` when the "↵ deep search" prompt should appear.
+    /// `Done` already implies no error (the error arm fires before `Done`
+    /// in `status_bar()`), so no extra error check is needed here.
+    pub(super) fn shows_deep_search_hint(&self, query_empty: bool) -> bool {
+        matches!(self, Self::Done(_)) && !query_empty
     }
 
     /// The label shown next to the spinner (or alone when idle).
@@ -174,12 +195,34 @@ impl SearchView {
         self.error = None;
         cx.notify();
 
+        // Parse the query so that:
+        //   1. plugins receive only the bare FTS terms as `value` (not the full
+        //      "p:~/ibm e:pdf" string that entity-search plugins cannot use);
+        //   2. the verbatim query is available via ctx.raw_query for file-index
+        //      plugins (localsearch, …) to extract whatever filter tokens they
+        //      understand.
+        // If parsing fails (mid-type, e.g. "ibm e:") fall back to the raw string.
+        let dispatch_value =
+            match sx_core::Query::from_str_with_registry(
+                &query_str,
+                vec![self.root.clone()],
+                Some(&registry),
+            ) {
+                Ok(q) => q
+                    .handler_tokens
+                    .first()
+                    .map(|t| String::from_utf8_lossy(&t.value).into_owned())
+                    .unwrap_or_else(|| query_str.clone()),
+                Err(_) => query_str.clone(),
+            };
+
         let (tx, mut rx) = mpsc::unbounded_channel::<ResultMsg>();
         let ctx = SxQueryContext {
             roots: sx_plugin_api::stabby::vec::Vec::new(),
             max_results: 0,
             timeout_ms: 0,
             case_sensitivity: SxCaseSensitivity::Smart,
+            raw_query: sx_plugin_api::SxBytes::from_str_bytes(&query_str),
         };
 
         // One token per live search.  A DropGuard derived from it is stored
@@ -188,12 +231,12 @@ impl SearchView {
         let live_token = tokio_util::sync::CancellationToken::new();
 
         {
-            let _enter = super::runtime().enter();
+            let _enter = super::super::runtime().enter();
             for ns in global_ns {
                 let cancel = live_token.clone();
                 let registry = Arc::clone(&registry);
                 let tx = tx.clone();
-                let value = query_str.clone();
+                let value = dispatch_value.clone();
                 let ctx = ctx.clone();
                 tokio::task::spawn_blocking(move || {
                     let sender = SxResultSender::from_fn(move |res: SxResult| {
@@ -300,7 +343,7 @@ impl SearchView {
         let (tx, mut rx) = mpsc::unbounded_channel::<ResultMsg>();
 
         {
-            let _enter = super::runtime().enter();
+            let _enter = super::super::runtime().enter();
             wire_search(&cq, n_workers(), tx);
         }
 

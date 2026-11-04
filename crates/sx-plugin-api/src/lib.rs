@@ -39,9 +39,6 @@ pub use stabby;
 /// other side unless you are certain both sides use the same global allocator
 /// (which is only guaranteed when both are compiled in the same `cargo build`
 /// invocation — i.e. for built-in, non-dlopen plugins).
-///
-/// For Phase 1 (built-in plugins only) this is safe. Phase 8 will address
-/// cross-allocator ownership with a `free` function pointer in the type.
 #[stabby::stabby]
 #[derive(Debug)]
 pub struct SxBytes {
@@ -51,10 +48,7 @@ pub struct SxBytes {
 }
 
 impl Clone for SxBytes {
-    /// Deep copy — allocates a fresh buffer and memcpys the content.
-    /// Necessary because `SxBytes` has manual ownership semantics: a derived
-    /// bitwise clone would alias the same allocation, causing a double-free
-    /// when both copies are later dropped.
+    /// Deep copy — a bitwise clone would alias the allocation and double-free.
     fn clone(&self) -> Self {
         Self::from_vec(self.as_bytes().to_vec())
     }
@@ -63,7 +57,7 @@ impl Clone for SxBytes {
 impl Drop for SxBytes {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: same allocator guaranteed for Phase 1 (built-in plugins).
+            // SAFETY: built-in plugins share the process allocator.
             // ptr/len/cap are exactly the fields of the original Vec<u8>.
             unsafe {
                 drop(Vec::from_raw_parts(
@@ -83,7 +77,6 @@ unsafe impl Send for SxBytes {}
 unsafe impl Sync for SxBytes {}
 
 impl SxBytes {
-    /// Construct from a `Vec<u8>`, consuming it.
     pub fn from_vec(v: Vec<u8>) -> Self {
         let mut v = std::mem::ManuallyDrop::new(v);
         Self {
@@ -93,12 +86,10 @@ impl SxBytes {
         }
     }
 
-    /// Construct from a `&str` by cloning the bytes.
     pub fn from_str_bytes(s: &str) -> Self {
         Self::from_vec(s.as_bytes().to_vec())
     }
 
-    /// View as a byte slice. Safe as long as the buffer is still alive.
     pub fn as_bytes(&self) -> &[u8] {
         if self.ptr.is_null() || self.len == 0 {
             return &[];
@@ -106,12 +97,10 @@ impl SxBytes {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
     }
 
-    /// View as a `&str`. Returns an empty str for non-UTF-8 content.
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
 
-    /// Consume and return the contents as a `Vec<u8>`.
     pub fn into_vec(self) -> Vec<u8> {
         let this = std::mem::ManuallyDrop::new(self);
         if this.ptr.is_null() {
@@ -121,7 +110,6 @@ impl SxBytes {
         unsafe { Vec::from_raw_parts(this.ptr, this.len as usize, this.cap as usize) }
     }
 
-    /// Consume and return the contents as a `String` (lossily if not UTF-8).
     pub fn into_string(self) -> String {
         String::from_utf8(self.into_vec())
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
@@ -148,7 +136,6 @@ pub struct SxMetaEntry {
 }
 
 impl SxMetaEntry {
-    /// Construct a text entry from `&str` key and value.
     pub fn text(key: &str, value: &str) -> Self {
         Self {
             key: SxBytes::from_str_bytes(key),
@@ -156,7 +143,6 @@ impl SxMetaEntry {
         }
     }
 
-    /// Construct a numeric entry from a `&str` key and `f64` value.
     pub fn number(key: &str, value: f64) -> Self {
         Self {
             key: SxBytes::from_str_bytes(key),
@@ -164,7 +150,6 @@ impl SxMetaEntry {
         }
     }
 
-    /// Construct a raw-bytes entry (e.g. PNG image data).
     pub fn bytes(key: &str, value: Vec<u8>) -> Self {
         Self {
             key: SxBytes::from_str_bytes(key),
@@ -216,28 +201,9 @@ impl SxResult {
     }
 }
 
-/// Helper: push a `Text` metadata entry onto an `SxResult`.
-///
-/// Equivalent to `result.metadata.push(SxMetaEntry::text(key, value))` but
-/// shorter at call sites.
-pub fn meta_text(result: &mut SxResult, key: &str, value: &str) {
-    result.metadata.push(SxMetaEntry::text(key, value));
-}
-
-/// Helper: push a `Number` metadata entry onto an `SxResult`.
-pub fn meta_number(result: &mut SxResult, key: &str, value: f64) {
-    result.metadata.push(SxMetaEntry::number(key, value));
-}
-
-/// Helper: push raw PNG bytes as a `Bytes` metadata entry.
-///
-/// Graphical renderers extract the bytes directly; text renderers skip
-/// `Bytes` entries entirely.
-pub fn meta_icon_png(result: &mut SxResult, png: Vec<u8>) {
-    result.metadata.push(SxMetaEntry::bytes("icon_png", png));
-}
-
 /// Case-sensitivity setting passed to handlers.
+// Mirrors `sx_parser::CaseSensitivity`; kept separate for ABI isolation.
+// The conversion lives in `sxc::shared::wire` — update both if variants change.
 #[stabby::stabby]
 #[repr(u8)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,11 +214,8 @@ pub enum SxCaseSensitivity {
     Insensitive,
 }
 
-/// Context the host provides to every `query()` call.
-///
-/// File handlers use `roots`; non-file handlers (calc, weather, …) ignore it.
 #[stabby::stabby]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SxQueryContext {
     /// Filesystem roots to search. Empty for non-file handlers.
     pub roots: stabby::vec::Vec<SxBytes>,
@@ -261,37 +224,32 @@ pub struct SxQueryContext {
     /// Timeout in milliseconds. `0` = unlimited.
     pub timeout_ms: u64,
     pub case_sensitivity: SxCaseSensitivity,
+    /// Verbatim query string. File-index plugins parse it for their own filters;
+    /// entity-search plugins should ignore it.
+    pub raw_query: SxBytes,
 }
 
 impl SxQueryContext {
-    /// Construct a minimal context suitable for unit tests.
     pub fn for_test() -> Self {
         Self {
             roots: stabby::vec::Vec::new(),
             max_results: 0,
             timeout_ms: 0,
             case_sensitivity: SxCaseSensitivity::Smart,
+            raw_query: SxBytes::from_str_bytes(""),
         }
     }
 }
 
 /// Opaque handle through which a handler pushes results to the host.
 ///
-/// The raw-pointer indirection means the concrete sender type never appears in
-/// the ABI — the host can change its channel implementation without breaking
-/// compiled plugins.
-///
-/// All fields are `extern "C"` function pointers with `IStable` arguments,
-/// making the struct itself `IStable` once annotated with `#[stabby::stabby]`.
+/// Raw-pointer indirection hides the concrete channel type from the ABI.
 #[stabby::stabby]
 pub struct SxResultSender {
-    /// Opaque pointer to the channel sender.
     ptr: *mut (),
-    /// `fn(ptr, result_ptr)` — takes ownership of a heap-allocated `SxResult`
-    /// (via `Box::from_raw`) and delivers it; returns `false` if host quit.
-    /// Passing by pointer avoids the `improper_ctypes` lint on stabby enums.
+    /// Takes ownership of a heap-allocated `SxResult` via `Box::from_raw`.
+    /// Returns `false` when the host has stopped listening.
     send_fn: extern "C" fn(*mut (), *mut SxResult) -> bool,
-    /// `fn(ptr)` — drops the sender, signalling end-of-stream to the host.
     drop_fn: extern "C" fn(*mut ()),
 }
 
@@ -299,9 +257,7 @@ pub struct SxResultSender {
 unsafe impl Send for SxResultSender {}
 
 impl SxResultSender {
-    /// Create an `SxResultSender` from any `Send` closure that accepts results.
-    ///
-    /// This is the constructor the host uses — it never appears in the plugin ABI.
+    /// Host-side constructor. Never appears in the plugin ABI.
     pub fn from_fn<F>(f: F) -> Self
     where
         F: FnMut(SxResult) -> bool + Send + 'static,
@@ -335,10 +291,7 @@ impl SxResultSender {
         }
     }
 
-    /// Send one result to the host.
-    ///
-    /// Returns `true` if the host is still listening, `false` if it has quit
-    /// or the channel is closed (the handler should stop sending when `false`).
+    /// Returns `false` when the channel is closed; the handler should stop sending.
     pub fn send(&self, result: SxResult) -> bool {
         // Heap-allocate to pass through the extern "C" boundary without
         // triggering improper_ctypes on the stabby enum payload.
@@ -393,12 +346,8 @@ pub enum SxNamespacePolicy {
 /// file_extensions:          ["1","2","3","4","5","6","7","8","9"]  ← walked by default
 /// file_extensions_optional: ["gz"]                                  ← only when user writes ext:gz
 /// ```
-// `no_opt` disables stabby's niche optimisation for this struct.
-// The niche optimiser relies on a single non-zero field being available, but
-// `SxHandlerInfo` contains several stabby enums (SxResultKind,
-// SxNamespacePolicy) whose niche requirements conflict.  Every other `#[stabby::stabby]`
-// type in this crate uses the default (no_opt is absent) because they either
-// have plain `#[repr(u8)]` enums or scalar fields that expose a safe niche.
+// no_opt: SxHandlerInfo contains several stabby enums with conflicting niche
+// requirements; default niche optimisation would miscompile the layout.
 #[stabby::stabby(no_opt)]
 #[derive(Clone, Debug)]
 pub struct SxHandlerInfo {
@@ -409,69 +358,44 @@ pub struct SxHandlerInfo {
     /// Short aliases (e.g. `["="]` for calc).
     pub aliases: stabby::vec::Vec<SxBytes>,
     pub description: SxBytes,
-    /// Short example shown when the user has typed `namespace:` but not yet
-    /// entered a value.  Use a concrete example (e.g. `"London"`) rather than
-    /// abstract syntax.  Empty string means no static hint.
+    /// Short example shown after `namespace:`. Use a concrete value, not abstract syntax.
     pub value_hint: SxBytes,
-    /// File extensions walked by default when this handler is registered.
-    /// Core unions these across all registered handlers to build the automatic
-    /// walk-tier Ext allow-list.  Empty for non-file handlers.
+    /// Extensions walked by default. Core unions these to build the automatic walk-tier allow-list.
     pub file_extensions: stabby::vec::Vec<SxBytes>,
-    /// File extensions this handler *can* process but does **not** walk by
-    /// default.  Included in the walk-tier only when the user explicitly
-    /// requests them via an `ext:` filter or a future config opt-in.
-    /// Empty for non-file handlers.
+    /// Extensions this handler can process but does not walk by default.
+    /// Only included in the walk-tier when the user explicitly requests them.
     pub file_extensions_optional: stabby::vec::Vec<SxBytes>,
-    /// How the registry handles a second handler claiming the same namespace.
-    /// See [`SxNamespacePolicy`] for the two options.
     pub namespace_policy: SxNamespacePolicy,
-    /// When `true` the host dispatches this handler for every bare query term
-    /// (i.e. queries with no `namespace:` prefix) in addition to explicit
-    /// `namespace:value` calls.
-    ///
-    /// Set this only for handlers that are fast enough to respond within the
-    /// interactive typing latency budget (sub-100 ms).  Examples: app launchers
-    /// that enumerate a pre-loaded list, or daemon-backed search endpoints that
-    /// hold an in-memory index.  Slow handlers (network calls, disk-heavy scans)
-    /// must leave this `false` and require the explicit namespace prefix.
+    /// When `true`, the host dispatches this handler for every bare query term
+    /// (no `namespace:` prefix). Only set for handlers fast enough for live-search
+    /// latency (sub-100 ms) — not for network calls or disk-heavy scans.
     pub global_scope: bool,
+    /// When `true`, results from this handler can satisfy file-system filter tokens
+    /// (`e:`, `m:`, `s:`, …). The host skips handlers where this is `false`
+    /// when the query contains file-system-only filters.
+    pub is_file_index: bool,
 }
 
-/// Output returned by [`SxExtractorHandle::extract`].
-///
-/// Three variants: extracted bytes, skip (file not in scope), or error.
+/// Output from [`SxExtractorHandle::extract`]: bytes, skip (not in scope), or error.
 #[stabby::stabby]
 #[repr(stabby)]
 #[derive(Clone, Debug)]
 pub enum SxExtractOutput {
-    /// The handler produced extracted bytes for this file.
-    /// The host runs content filters against these bytes.
     Bytes(SxBytes),
-    /// The handler cannot process this file — skip it silently.
-    /// Returned when the file extension / magic bytes do not match.
+    /// File extension / magic bytes did not match — skip silently.
     Skip(bool),
-    /// Extraction was attempted but failed (corrupt file, I/O error, …).
-    /// The host surfaces this as an error match rather than silently dropping.
+    /// Extraction failed (corrupt file, I/O error, …); surfaced as an error result.
     Error(SxBytes),
 }
 
 /// Opaque per-thread file extractor handle.
 ///
-/// The concrete extractor lives behind a raw pointer so the `SxHandler` vtable
-/// never needs to name a `dyn Trait` — keeping the type `IStable`.
-///
-/// `prepare_extract` is called once per worker thread. The returned handle is
-/// owned exclusively by that thread for the full search — no shared state on
-/// the hot per-file path. Non-file handlers return `None()`.
+/// One handle per worker thread — no shared state on the per-file hot path.
+/// Non-file handlers return `None()` from `prepare_extract`.
 #[stabby::stabby]
 pub struct SxExtractorHandle {
-    /// Opaque pointer to the extractor state (allocated by the plugin).
     ptr: *mut (),
-    /// `fn(ptr, path_ptr, path_len, out_ptr)` — writes the result into a
-    /// heap-allocated `SxExtractOutput` (via `Box::into_raw`) to avoid the
-    /// `improper_ctypes` lint on the stabby enum return type.
     extract_fn: extern "C" fn(*mut (), *const u8, u64, *mut SxExtractOutput),
-    /// `fn(ptr)` — drops the extractor state.
     drop_fn: extern "C" fn(*mut ()),
 }
 
@@ -479,9 +403,7 @@ pub struct SxExtractorHandle {
 unsafe impl Send for SxExtractorHandle {}
 
 impl SxExtractorHandle {
-    /// Construct an `SxExtractorHandle` from any `Send` closure.
-    ///
-    /// Used by file-handler plugins to wrap their extractor state.
+    /// Wrap a `Send` closure as an extractor handle. Used by file-handler plugins.
     pub fn from_fn<F>(f: F) -> Self
     where
         F: FnMut(&[u8]) -> SxExtractOutput + Send + 'static,
@@ -519,9 +441,8 @@ impl SxExtractorHandle {
         }
     }
 
-    /// Extract searchable content from the file at `path` (raw bytes).
     pub fn extract(&mut self, path: &[u8]) -> SxExtractOutput {
-        // Stack slot written by extract_fn via pointer — no heap allocation.
+        // Written via pointer; no heap allocation.
         let mut out = std::mem::MaybeUninit::<SxExtractOutput>::uninit();
         (self.extract_fn)(self.ptr, path.as_ptr(), path.len() as u64, out.as_mut_ptr());
         // SAFETY: `extract_fn` always initialises `out`.
@@ -535,8 +456,6 @@ impl Drop for SxExtractorHandle {
     }
 }
 
-// ── Hint types ────────────────────────────────────────────────────────────────
-
 /// A single completion suggestion returned by [`SxHandler::hints`].
 #[stabby::stabby]
 #[derive(Clone, Debug)]
@@ -547,10 +466,8 @@ pub struct SxHintEntry {
     pub completion: SxBytes,
 }
 
-/// A list of completion hints returned by [`SxHandler::hints`].
-///
-/// An empty list means the handler has no completions to offer for the current
-/// partial value — the static [`SxHandlerInfo::value_hint`] is shown instead.
+/// Completion hints from [`SxHandler::hints`]. Empty means no dynamic completions;
+/// the static [`SxHandlerInfo::value_hint`] is shown instead.
 #[stabby::stabby]
 #[derive(Clone, Debug)]
 pub struct SxHints {
@@ -558,7 +475,6 @@ pub struct SxHints {
 }
 
 impl SxHints {
-    /// Construct an empty hint list.
     pub fn empty() -> Self {
         Self {
             items: stabby::vec::Vec::new(),
@@ -566,23 +482,13 @@ impl SxHints {
     }
 }
 
-/// The core trait every `sx` plugin must implement.
-///
-/// All methods are `extern "C"` as required by stabby's vtable machinery.
-/// The unchecked `#[stabby::stabby]` form is used because `SxQueryContext`
-/// contains a `stabby::vec::Vec` whose `IStable` bound can only be verified
-/// at vtable instantiation time, not at trait definition time.
+/// Core trait every plugin must implement. Methods are `extern "C"` for stabby's vtable.
 #[stabby::stabby]
 pub trait SxHandler: Send + Sync {
-    /// Return metadata describing this handler. Called once at load time.
     extern "C" fn info(&self) -> SxHandlerInfo;
 
-    /// Execute a query token.
-    ///
-    /// `value` is the part after the namespace colon, e.g. for `calc:2+2`
-    /// this receives `"2+2"`. The handler pushes results into `sender` and
-    /// returns when done. It may spawn internal threads or tasks; the host
-    /// never touches `sender` after this call returns.
+    /// Execute a query token. `value` is the part after the colon (e.g. `"2+2"` for `calc:2+2`).
+    /// Push results into `sender`; `sender` is released when this returns.
     extern "C" fn query(
         &self,
         value: stabby::str::Str<'_>,
@@ -590,59 +496,28 @@ pub trait SxHandler: Send + Sync {
         sender: SxResultSender,
     );
 
-    /// Return a per-thread file extractor, or `None` if this handler does not
-    /// process files.
-    ///
-    /// Called **once per worker thread** at query compile time.  The returned
-    /// [`SxExtractorHandle`] is owned exclusively by that thread for the
-    /// duration of the search — no synchronization on the hot per-file path.
-    ///
-    /// - Non-file handlers (calc, weather, sys, …): return `None()`.
-    /// - File handlers (text, pdf, office, …): return `Some(handle)` where the
-    ///   handle's closure captures any per-thread extractor state.  The host
-    ///   calls `handle.extract(path)` once per candidate file.
-    ///
-    /// The default implementation returns `None` — non-file handlers need not
-    /// override this method.  File handlers override it and return `Some`.
+    /// Return a per-thread extractor, or `None` for non-file handlers.
+    /// Called once per worker thread; the handle is owned by that thread
+    /// for the whole search — no synchronisation on the per-file hot path.
     extern "C" fn prepare_extract(&self) -> stabby::option::Option<SxExtractorHandle>;
 
-    /// Return completion hints for a partial value string.
-    ///
-    /// Called on every keystroke while the cursor is in this handler's
-    /// namespace. **Must return in under a millisecond** — no I/O, no network,
-    /// no IPC. Handlers backed by remote/disk data should return [`SxHints::empty()`].
+    /// Return hints for a partial value string.
+    /// **Must be < 1 ms** — no I/O, network, or IPC.
     extern "C" fn hints(&self, partial_value: stabby::str::Str<'_>) -> SxHints;
 }
 
-/// Declare the plugin entry point for an `sx` handler.
-///
-/// Every plugin crate must call this macro exactly once at the crate root,
-/// passing the expression that constructs the handler:
-///
-/// ```rust,ignore
-/// sx_plugin_api::declare_plugin!(MyHandler);
-/// // or with a constructor call:
-/// sx_plugin_api::declare_plugin!(MyHandler::new());
-/// ```
-///
-/// The macro emits `mod _plugin_init { ... }` containing the `#[stabby::export]`
-/// function `sx_plugin_init` that `stabby` resolves at load time.  Using a
-/// single definition here rather than hand-rolling it in every crate prevents
-/// copy-paste divergence in this `unsafe`-adjacent FFI boilerplate.
+/// Emits the `#[stabby::export]` entry point `sx_plugin_init`.
+/// Call once at the crate root: `declare_plugin!(MyHandler)`.
 #[macro_export]
 macro_rules! declare_plugin {
     ($handler:expr) => {
         mod _plugin_init {
-            // stabby::boxed::Box must shadow std::boxed::Box so that
-            // the `dynptr!` macro resolves to the stabby Box, not std's.
+            // stabby::boxed::Box must shadow std::boxed::Box here.
             use $crate::stabby::boxed::Box;
 
             #[$crate::stabby::export]
             pub extern "C" fn sx_plugin_init(
             ) -> $crate::stabby::dynptr!(Box<dyn $crate::SxHandler + Send + Sync>) {
-                // The handler expression is captured from the outer scope.
-                // Using `#[allow(unused_imports)]` avoids spurious warnings
-                // when `super` items are brought into scope.
                 #[allow(unused_imports)]
                 use super::*;
                 Box::new($handler).into()

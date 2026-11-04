@@ -1,41 +1,25 @@
 //! Search wiring shared by both frontends.
 //!
 //! [`wire_search`] starts all background workers for a [`CompiledQuery`] and
-//! feeds results into a [`ResultMsg`] channel.  Both `sxc` (TUI) and `sxg`
-//! (GUI) call this identically — neither frontend touches this file.
+//! feeds results into a [`ResultMsg`] channel.
 //!
 //! ## Concurrency model
 //!
-//! * **File workers** — `ncpu - 2` tokio tasks, each driving
-//!   [`CompiledQuery::run()`] on a clone of the compiled query.  The first
-//!   task to be polled atomically claims the walker role; the rest become pure
-//!   content workers that steal from the shared injector.  All I/O (file reads,
-//!   plugin extraction) is blocking but brief; `tokio::task::spawn_blocking` is
-//!   not needed because `run()` yields cooperatively every 64 steals so the
-//!   executor remains responsive.
+//! * **File workers** — `ncpu - 2` tokio tasks, each driving [`CompiledQuery::run()`].
+//!   The first task polled atomically claims the walker role; the rest steal from
+//!   the shared injector.  Workers yield cooperatively every 64 steals.
 //!
 //! * **Handler tasks** — one `tokio::task::spawn_blocking` per handler token.
-//!   Plugin `dispatch()` is a synchronous FFI call and must not run on a
-//!   cooperative task.  Each blocking task pushes [`ResultMsg`] messages
-//!   directly into `tx`.
+//!   Plugin `dispatch()` is a synchronous FFI call and must not run on a cooperative task.
 //!
 //! ## Cancellation
 //!
-//! Cancellation is driven by [`CompiledQuery::token()`], a [`CancellationToken`]
-//! shared (via `Arc`) across all query clones.  Calling [`CompiledQuery::cancel()`]
-//! fires the token, which:
+//! Driven by the [`CancellationToken`] in [`CompiledQuery::token()`].  Firing it:
+//! * wakes file workers blocked in the `Steal::Empty` `select!`;
+//! * causes `token.run_until_cancelled(…)` wrappers to drop at the next `await`;
+//! * causes handler `SxResultSender` callbacks to return `false`.
 //!
-//! * wakes file workers that are blocked in the `Steal::Empty` `select!` inside
-//!   [`CompiledQuery::run()`] without any extra `notify_waiters` call;
-//! * causes the `token.run_until_cancelled(…)` wrappers here to drop their
-//!   inner futures at the next `await` point;
-//! * causes the `SxResultSender` callback in blocking handler tasks to return
-//!   `false` on the next plugin callback.
-//!
-//! `wire_search` never cancels the query itself — that responsibility belongs
-//! entirely to the owner of the [`SearchHandle`] (via its [`DropGuard`]).
-//!
-//! [`DropGuard`]: tokio_util::sync::DropGuard
+//! Cancellation is the responsibility of the [`SearchHandle`] owner, not `wire_search`.
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -44,10 +28,21 @@ use sx_core::CompiledQuery;
 
 use crate::shared::msg::ResultMsg;
 
+/// Convert the parser's case-sensitivity enum to the plugin-API equivalent.
+///
+/// The two types are separate because `sx-plugin-api` must not depend on `sx-parser`
+/// (ABI isolation). Keep in sync when either enum changes.
+fn to_sx_case(c: sx_core::CaseSensitivity) -> sx_plugin_api::SxCaseSensitivity {
+    match c {
+        sx_core::CaseSensitivity::Smart       => sx_plugin_api::SxCaseSensitivity::Smart,
+        sx_core::CaseSensitivity::Sensitive   => sx_plugin_api::SxCaseSensitivity::Sensitive,
+        sx_core::CaseSensitivity::Insensitive => sx_plugin_api::SxCaseSensitivity::Insensitive,
+    }
+}
+
 /// Returns the number of file-search worker tasks to use.
 ///
-/// Uses all logical CPUs minus 2 (one reserved for the UI task, one for the
-/// OS scheduler headroom), with a minimum of 1.
+/// All logical CPUs minus 2 (one for the UI task, one for OS headroom), minimum 1.
 pub fn n_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2))
@@ -57,14 +52,9 @@ pub fn n_workers() -> usize {
 
 /// Start all background work for a compiled query and wire results into `tx`.
 ///
-/// Spawns:
-/// * `n` tokio tasks, each driving [`CompiledQuery::run()`] on a clone of the
-///   compiled query.  File hits arrive as [`ResultMsg`] with `namespace = "file"`.
-/// * One `tokio::task::spawn_blocking` per handler token.  Each calls the
-///   plugin's synchronous `dispatch()` and sends [`ResultMsg`] items.
-///
-/// The caller must drop its own clone of `tx` after this returns so the
-/// channel closes when the last worker finishes.
+/// Spawns `n` file-worker tasks and one `spawn_blocking` task per handler token.
+/// The caller must drop its own `tx` clone after this returns so the channel
+/// closes when the last worker finishes.
 pub fn wire_search(cq: &CompiledQuery, n: usize, tx: mpsc::UnboundedSender<ResultMsg>) {
     log::debug!(
         "wire: starting search — {} file-worker(s), {} handler token(s)",
@@ -72,26 +62,17 @@ pub fn wire_search(cq: &CompiledQuery, n: usize, tx: mpsc::UnboundedSender<Resul
         cq.handler_tokens.len()
     );
 
-    // ── Handler tokens (calc, localsearch, apps, …) ───────────────────────────
-    // Plugin dispatch() is a blocking FFI call — use spawn_blocking so it
-    // doesn't starve cooperative tasks on the tokio executor.
+    // Plugin dispatch() is a blocking FFI call — use spawn_blocking.
     if let Some(registry) = cq.registry.clone() {
         let ctx = sx_plugin_api::SxQueryContext {
             roots: sx_plugin_api::stabby::vec::Vec::new(),
             max_results: 0,
             timeout_ms: 0,
-            case_sensitivity: match cq.options.case {
-                sx_core::CaseSensitivity::Smart => sx_plugin_api::SxCaseSensitivity::Smart,
-                sx_core::CaseSensitivity::Sensitive => sx_plugin_api::SxCaseSensitivity::Sensitive,
-                sx_core::CaseSensitivity::Insensitive => {
-                    sx_plugin_api::SxCaseSensitivity::Insensitive
-                }
-            },
+            case_sensitivity: to_sx_case(cq.options.case.clone()),
+            raw_query: sx_plugin_api::SxBytes::from_str_bytes(&cq.raw_query),
         };
 
         for token in &cq.handler_tokens {
-            // Clone the CancellationToken — cheap (just an Arc clone), avoids
-            // a full CompiledQuery clone solely for the cancellation signal.
             let cancel = cq.token();
             let registry = registry.clone();
             let tx = tx.clone();
@@ -103,7 +84,6 @@ pub fn wire_search(cq: &CompiledQuery, n: usize, tx: mpsc::UnboundedSender<Resul
             log::debug!("wire: dispatching handler {}:{:?}", ns_str, value);
             tokio::task::spawn_blocking(move || {
                 let sender = sx_plugin_api::SxResultSender::from_fn(move |res| {
-                    // Return false immediately if cancelled or the consumer is gone.
                     if cancel.is_cancelled() || tx.is_closed() {
                         return false;
                     }
@@ -130,13 +110,8 @@ pub fn wire_search(cq: &CompiledQuery, n: usize, tx: mpsc::UnboundedSender<Resul
         }
     }
 
-    // ── File search workers ───────────────────────────────────────────────────
-    // Each task drives cq.clone().run() — the first one polled claims the
-    // walker role; the rest steal content work from the shared injector.
-    //
-    // `token.run_until_cancelled(...)` wraps the stream-consuming loop so that
-    // when the query is cancelled the task exits at the next `await` point
-    // inside `run()` without any explicit `is_cancelled()` poll in this loop.
+    // Each task drives cq.clone().run() — first polled claims the walker role,
+    // rest steal from the shared injector.
     let workers = n.max(1);
     log::debug!("wire: spawning {} file-search worker task(s)", workers);
     for i in 0..workers {

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/sx-parser",
     "crates/sx-plugin-api",
     "crates/sx-core",
     "crates/sx-plugin-calc",
@@ -28,6 +29,7 @@ gpui-kit       = { version = "0.7.1", features = ["component", "assets"] }
 gpui-component = { version = "0.7.1" }
 
 # Internal crates
+sx-parser     = { path = "crates/sx-parser" }
 sx-plugin-api = { path = "crates/sx-plugin-api" }
 sx-core       = { path = "crates/sx-core" }
 

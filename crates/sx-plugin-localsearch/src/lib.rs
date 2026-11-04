@@ -8,25 +8,31 @@
 //! `localsearch search` uses.  Results carry the file URI as `action`, the
 //! file name as `title`, and the MIME type as `body`.
 //!
-//! The connection **and** a compiled `SparqlStatement` are opened **once** at
-//! handler construction time and reused across all subsequent queries.  Using
-//! a prepared statement (rather than a raw `conn.query()` string) matches the
-//! approach taken by the `localsearch search` CLI and avoids the per-row
-//! D-Bus round-trip overhead that makes cursor iteration ~20 ms/row.
+//! ## Two prepared statements
 //!
-//! ## Usage
+//! Both are compiled **once** at construction time:
 //!
-//! ```text
-//! localsearch:readme       → all indexed files matching "readme"
-//! localsearch:report 2024  → files matching both "report" AND "2024"
-//! ```
+//! | Statement | Used when | Binds |
+//! |-----------|-----------|-------|
+//! | `stmt` | No file-system filters in query | `match`, `limit` |
+//! | `stmt_filtered` | Any of `e:`, `mime:`, `p:`, `m:`, `s:` in query | above + skip flags + values |
 //!
-//! Multiple query words are joined with spaces; `fts:match` treats them as a
-//! logical AND by default.
+//! The fast path is taken for plain text queries; the filtered path is taken
+//! when `extract_sparql_filters` detects at least one file-system constraint in
+//! `ctx.raw_query`.
+//!
+//! ## SPARQL filter strategy
+//!
+//! `stmt_filtered` uses boolean `~skip_*` parameters for every constraint so a
+//! single compiled plan covers all filter combinations.  SPARQL's `||`
+//! short-circuits, so `FILTER(true || REGEX(...))` never evaluates the REGEX.
+//! OPTIONALs for `?mtime` and `?fsize` add one extra B-tree lookup per row on
+//! the same `nfo:FileDataObject` already joined for the URL — negligible cost.
 
 use std::time::Instant;
+use sx_parser::{from_str_lenient, Filter, RangeExpr, Timestamp};
 use sx_plugin_api::{
-    meta_text, stabby, SxBytes, SxHandlerInfo, SxNamespacePolicy, SxQueryContext, SxResult,
+    stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext, SxResult,
     SxResultSender,
 };
 use tracker::prelude::SparqlCursorExtManual;
@@ -35,30 +41,9 @@ use tracker::prelude::SparqlCursorExtManual;
 
 const LOCALSEARCH_BUS: &str = "org.freedesktop.LocalSearch3";
 
-// ── SPARQL prepared-statement template ───────────────────────────────────────
+// ── SPARQL prepared-statement templates ──────────────────────────────────────
 
-/// SPARQL query with named placeholders (`~match`, `~limit`).
-///
-/// Key design points:
-/// - `fts:match` is on the *content* objects (`nfo:TextDocument`, etc.) which
-///   live in the `tracker:Documents` named graph.  The *storage* objects
-///   (`nfo:FileDataObject`, with `nie:url`) live in `tracker:FileSystem`.
-///   Querying `?r a nfo:FileDataObject ; fts:match …` only returns the 2 files
-///   whose FTS data sits directly on the storage node; all the rest are missed.
-/// - `nie:isStoredAs` links the content object to the storage object.
-/// - The `ORDER BY DESC(fts:rank(?r))` must live in a subquery scoped to the
-///   `tracker:Documents` graph.  Placing it at the outer level (after the
-///   cross-graph `nie:isStoredAs` join) forces a full sort across both graphs
-///   and causes ~90 ms per row (~3 s for 35 rows).  The subquery + outer join
-///   pattern runs in ~35 ms total.
-/// - `~match` — bound via `SparqlStatement::bind_string`; no string
-///   interpolation, so no injection risk and no escaping needed.
-/// - `~limit` — bound via `SparqlStatement::bind_int`.
-///
-/// Note: `fts:rank(?r)` is used only in `ORDER BY` — reading it back via
-/// `cursor.double()` from a computed `SELECT` column returns 1.0 for every
-/// row (Tracker cursor limitation).  Scores are assigned by row position
-/// instead: see [`row_score`].
+/// Fast path — only `~match` and `~limit` are bound.
 const SPARQL_TEMPLATE: &str = "\
     SELECT ?url ?mime \
     WHERE { \
@@ -76,53 +61,188 @@ const SPARQL_TEMPLATE: &str = "\
       ?fo nie:url ?url . \
     }";
 
-/// Convert a 0-based row position into a base score in `(0.0, 0.5]`.
+/// Filtered path — FTS subquery plus OPTIONAL metadata joins and seven boolean
+/// skip-flag/value parameter pairs (one per supported file-system filter).
 ///
-/// Row 0 (best FTS rank) → 0.5, row 1 → 0.499…, etc., using an exponential
-/// decay so the first few results are meaningfully separated.  The ceiling of
-/// 0.5 guarantees that *all* localsearch results score below every apps result
-/// (which uses scores in `[0.8, 1.0]`).
-#[inline]
-fn row_score(row: usize) -> f64 {
-    // 0.5 * e^(-row * 0.05) — decays slowly so results aren't all squashed
-    // to the same value, but stays well below 0.5 after ~14 rows.
-    0.5 * (-0.05 * row as f64).exp()
+/// SPARQL `||` short-circuits so a `true` skip-flag never evaluates the
+/// expensive operand.  OPTIONALs for `?mtime` / `?fsize` are cheap B-tree
+/// lookups on the already-joined `nfo:FileDataObject`.
+const SPARQL_FILTERED_TEMPLATE: &str = "\
+    SELECT ?url ?mime \
+    WHERE { \
+      { \
+        SELECT ?r ?mime WHERE { \
+          GRAPH tracker:Documents { \
+            ?r fts:match ~match . \
+            OPTIONAL { ?r nie:mimeType ?mime } \
+          } \
+        } \
+        ORDER BY DESC(fts:rank(?r)) \
+        LIMIT ~limit \
+      } \
+      ?r nie:isStoredAs ?fo . \
+      GRAPH tracker:FileSystem { \
+        ?fo nie:url ?url . \
+        OPTIONAL { ?fo nfo:fileLastModified ?mtime } \
+        OPTIONAL { ?fo nfo:fileSize ?fsize } \
+      } \
+      FILTER(~skip_ext || REGEX(LCASE(STR(?url)), ~ext_pattern)) \
+      FILTER(~skip_mime || CONTAINS(LCASE(STR(COALESCE(?mime, \"\"))), ~mime_lc)) \
+      FILTER(~skip_path || CONTAINS(LCASE(STR(?url)), ~path_lc)) \
+      FILTER(~skip_mtime_after  || !BOUND(?mtime) || ?mtime >= ~mtime_after) \
+      FILTER(~skip_mtime_before || !BOUND(?mtime) || ?mtime <= ~mtime_before) \
+      FILTER(~skip_size_min || !BOUND(?fsize) || ?fsize >= ~size_min) \
+      FILTER(~skip_size_max || !BOUND(?fsize) || ?fsize <= ~size_max) \
+    }";
+
+// ── SPARQL filter binding values ──────────────────────────────────────────────
+
+/// File-system constraints ready for SPARQL binding.
+///
+/// Built from `ctx.raw_query` by [`extract_sparql_filters`] using the
+/// canonical `sx-parser` Filter AST — no hand-rolled parsing.
+#[derive(Default)]
+struct SpqFilters {
+    /// Lowercased extensions without the dot (e.g. `["pdf", "docx"]`).
+    extensions: Vec<String>,
+    /// MIME substring (e.g. `"image/"`).
+    mime_contains: String,
+    /// Path substring (e.g. `"/home/user/documents"`).
+    path_contains: String,
+    /// Modified-after: Unix seconds. `0` = unconstrained.
+    mtime_after_secs: i64,
+    /// Modified-before: Unix seconds. `0` = unconstrained.
+    mtime_before_secs: i64,
+    /// Minimum size in bytes. `0` = unconstrained.
+    size_min_bytes: i64,
+    /// Maximum size in bytes. `i64::MAX` = unconstrained.
+    size_max_bytes: i64,
 }
 
-/// Virtual row advance applied to PDF results.
+impl SpqFilters {
+    fn is_any_active(&self) -> bool {
+        !self.extensions.is_empty()
+            || !self.mime_contains.is_empty()
+            || !self.path_contains.is_empty()
+            || self.mtime_after_secs != 0
+            || self.mtime_before_secs != 0
+            || self.size_min_bytes != 0
+            || self.size_max_bytes != i64::MAX
+    }
+
+    fn ext_regex_pattern(&self) -> String {
+        format!("\\.({})$", self.extensions.join("|"))
+    }
+}
+
+// ── Filter extraction from real AST ──────────────────────────────────────────
+
+/// Parse `raw` leniently via `sx-parser` and walk the `walk_filter` tree to
+/// extract the file-system constraints this plugin can honour in SPARQL.
 ///
-/// Instead of multiplying the score (which can never overcome the gap between
-/// adjacent FTS rows), we pretend the PDF arrived this many rows *earlier* in
-/// the FTS ranking before calling [`row_score`].  The result is capped at 0.5
-/// so the guarantee that localsearch results always rank below apps results
-/// (which score in `[0.8, 1.0]`) is preserved.
-///
-/// With a decay of `e^{-0.05}` per row ≈ 5.1 % per step, an advance of 10
-/// rows means a PDF at FTS position N scores the same as a non-PDF at position
-/// N-10, comfortably beating all non-PDFs within 9 rows above it.
+/// Unknown tokens and syntax errors are silently ignored (lenient mode).
+/// Negated match expressions are skipped — SPARQL NOT is not yet supported.
+fn extract_sparql_filters(raw: &str) -> SpqFilters {
+    let mut f = SpqFilters {
+        size_max_bytes: i64::MAX,
+        ..Default::default()
+    };
+    let query = from_str_lenient(raw);
+    collect_filter(&query.walk_filter, &mut f);
+    f
+}
+
+fn collect_filter(filter: &Filter, f: &mut SpqFilters) {
+    match filter {
+        Filter::Ext(exts) => {
+            for ext in exts {
+                let s = String::from_utf8_lossy(ext).to_lowercase();
+                if !f.extensions.contains(&s) {
+                    f.extensions.push(s);
+                }
+            }
+        }
+        Filter::Mime(expr) if !expr.negated => {
+            if f.mime_contains.is_empty() {
+                f.mime_contains = String::from_utf8_lossy(&expr.value).to_lowercase();
+            }
+        }
+        Filter::Path(expr) if !expr.negated => {
+            if f.path_contains.is_empty() {
+                f.path_contains = String::from_utf8_lossy(&expr.value).into_owned();
+            }
+        }
+        // Modified, Created, Accessed all map to mtime in the SPARQL model.
+        Filter::Modified(range) | Filter::Created(range) | Filter::Accessed(range) => {
+            apply_mtime(range, f);
+        }
+        Filter::Size(range) => apply_size(range, f),
+        Filter::And(children) => {
+            for child in children {
+                collect_filter(child, f);
+            }
+        }
+        // Not, Or, Name, Content, Line, Hidden, Type, PermOctal, PermFlag,
+        // Owner, Group, Meta, Any — nothing to extract for SPARQL binding.
+        _ => {}
+    }
+}
+
+/// Map a `RangeExpr<Timestamp>` onto the `mtime_after_secs` / `mtime_before_secs`
+/// SPARQL bounds.  `Timestamp.0` is nanoseconds since the Unix epoch.
+fn apply_mtime(range: &RangeExpr<Timestamp>, f: &mut SpqFilters) {
+    let to_secs = |ts: &Timestamp| (ts.0 / 1_000_000_000) as i64;
+    match range {
+        RangeExpr::Gt(ts) => f.mtime_after_secs = to_secs(ts),
+        RangeExpr::Lt(ts) => f.mtime_before_secs = to_secs(ts),
+        RangeExpr::Eq(ts) => {
+            f.mtime_after_secs = to_secs(ts);
+            f.mtime_before_secs = to_secs(ts);
+        }
+        RangeExpr::Between(lo, hi) => {
+            f.mtime_after_secs = to_secs(lo);
+            f.mtime_before_secs = to_secs(hi);
+        }
+    }
+}
+
+/// Map a `RangeExpr<u64>` (bytes) onto the `size_min_bytes` / `size_max_bytes`
+/// SPARQL bounds.
+fn apply_size(range: &RangeExpr<u64>, f: &mut SpqFilters) {
+    match range {
+        RangeExpr::Gt(n) => f.size_min_bytes = *n as i64,
+        RangeExpr::Lt(n) => f.size_max_bytes = *n as i64,
+        RangeExpr::Eq(n) => {
+            f.size_min_bytes = *n as i64;
+            f.size_max_bytes = *n as i64;
+        }
+        RangeExpr::Between(lo, hi) => {
+            f.size_min_bytes = *lo as i64;
+            f.size_max_bytes = *hi as i64;
+        }
+    }
+}
+
+// ── Scoring helpers ───────────────────────────────────────────────────────────
+
+#[inline]
+fn row_score(row: usize) -> f64 {
+    (0.5 * (-0.05 * row as f64).exp()).min(0.5)
+}
+
 const PDF_ROW_ADVANCE: usize = 10;
 
 // ── Thread-safety wrapper ─────────────────────────────────────────────────────
 
-/// `SparqlStatement` is a GObject refcount type; `tracker-rs` does not add
-/// `unsafe impl Send + Sync` for it the way it does for `SparqlConnection`.
-/// We only ever call the statement from the single thread that owns the handler
-/// (plugin queries are dispatched serially), so the assertion is sound.
 struct SendSyncStatement(tracker::SparqlStatement);
 unsafe impl Send for SendSyncStatement {}
 unsafe impl Sync for SendSyncStatement {}
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
-/// LocalSearch full-text-search handler.
-///
-/// Holds a persistent D-Bus connection and a compiled `SparqlStatement` so
-/// both the handshake cost and the query-parse/plan cost are paid only once.
 pub struct LocalSearchHandler {
-    /// Compiled prepared statement derived from [`SPARQL_TEMPLATE`].
-    /// `None` when the daemon was not running at construction time (lazy
-    /// fallback: retry on first query).
     stmt: Option<SendSyncStatement>,
+    stmt_filtered: Option<SendSyncStatement>,
 }
 
 impl Default for LocalSearchHandler {
@@ -133,84 +253,73 @@ impl Default for LocalSearchHandler {
 
 impl LocalSearchHandler {
     pub fn new() -> Self {
-        // Initialise env_logger for this plugin's own `log` crate instance.
         let _ = env_logger::try_init();
-
         let t = Instant::now();
-        let stmt = match tracker::SparqlConnection::bus_new(LOCALSEARCH_BUS, None, None) {
-            Err(_) => {
-                log::warn!(
-                    "localsearch: daemon not running ({:.1}ms); will retry on first query",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-                None
-            }
-            Ok(conn) => {
-                log::info!(
-                    "localsearch: D-Bus connection opened in {:.1}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-                let t2 = Instant::now();
-                match conn.query_statement(SPARQL_TEMPLATE, gio::Cancellable::NONE) {
-                    Ok(s) => {
-                        log::debug!(
-                            "localsearch: statement compiled in {:.1}ms",
-                            t2.elapsed().as_secs_f64() * 1000.0
-                        );
-                        Some(SendSyncStatement(s))
-                    }
-                    Err(e) => {
-                        log::warn!("localsearch: failed to compile statement: {e}");
-                        None
-                    }
+        let (stmt, stmt_filtered) =
+            match tracker::SparqlConnection::bus_new(LOCALSEARCH_BUS, None, None) {
+                Err(_) => {
+                    log::warn!(
+                        "localsearch: daemon not running ({:.1}ms); will retry on first query",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    );
+                    (None, None)
                 }
-            }
-        };
-
-        Self { stmt }
+                Ok(conn) => {
+                    log::info!(
+                        "localsearch: D-Bus connection opened in {:.1}ms",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let base = conn
+                        .query_statement(SPARQL_TEMPLATE, gio::Cancellable::NONE)
+                        .map_err(|e| log::warn!("localsearch: base stmt: {e}"))
+                        .ok()
+                        .map(SendSyncStatement);
+                    let filtered = conn
+                        .query_statement(SPARQL_FILTERED_TEMPLATE, gio::Cancellable::NONE)
+                        .map_err(|e| log::warn!("localsearch: filtered stmt: {e}"))
+                        .ok()
+                        .map(SendSyncStatement);
+                    (base, filtered)
+                }
+            };
+        Self { stmt, stmt_filtered }
     }
 
-    /// Return the cached prepared statement, or compile a fresh one if we
-    /// didn't have a connection at construction time.  Returns `None` if the
-    /// daemon is still unavailable.
     fn statement(&self) -> Option<tracker::SparqlStatement> {
         if let Some(ref s) = self.stmt {
-            // Clone the GObject reference — cheap refcount bump, no I/O.
             return Some(s.0.clone());
         }
-        // No cached statement: daemon was not running at construction time.
-        // Try to open a fresh connection and compile the statement now.
-        log::debug!("localsearch: no cached statement, attempting fresh connect");
-        let t = Instant::now();
         let conn = tracker::SparqlConnection::bus_new(LOCALSEARCH_BUS, None, None).ok()?;
-        log::debug!(
-            "localsearch: fresh connect ok ({:.1}ms)",
-            t.elapsed().as_secs_f64() * 1000.0
-        );
-        match conn.query_statement(SPARQL_TEMPLATE, gio::Cancellable::NONE) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log::warn!("localsearch: failed to compile statement on retry: {e}");
-                None
-            }
+        conn.query_statement(SPARQL_TEMPLATE, gio::Cancellable::NONE).ok()
+    }
+
+    fn filtered_statement(&self) -> Option<tracker::SparqlStatement> {
+        if let Some(ref s) = self.stmt_filtered {
+            return Some(s.0.clone());
         }
+        let conn = tracker::SparqlConnection::bus_new(LOCALSEARCH_BUS, None, None).ok()?;
+        conn.query_statement(SPARQL_FILTERED_TEMPLATE, gio::Cancellable::NONE)
+            .ok()
     }
 }
 
-impl sx_plugin_api::SxHandler for LocalSearchHandler {
+use sx_plugin_api::SxHandler;
+
+impl SxHandler for LocalSearchHandler {
     extern "C" fn info(&self) -> SxHandlerInfo {
         SxHandlerInfo {
             handler_version: SxBytes::from_str_bytes(env!("CARGO_PKG_VERSION")),
             namespace: SxBytes::from_str_bytes("localsearch"),
             aliases: stabby::vec::Vec::new(),
             description: SxBytes::from_str_bytes(
-                "Search indexed files via the LocalSearch/Tracker3 daemon (localsearch:<terms>)",
+                "Search indexed files via the LocalSearch/Tracker3 daemon",
             ),
             value_hint: SxBytes::from_str_bytes("search terms"),
             file_extensions: stabby::vec::Vec::new(),
             file_extensions_optional: stabby::vec::Vec::new(),
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: true,
+            is_file_index: true,
         }
     }
 
@@ -220,129 +329,25 @@ impl sx_plugin_api::SxHandler for LocalSearchHandler {
         ctx: &SxQueryContext,
         sender: SxResultSender,
     ) {
-        let t_query = Instant::now();
+        let t = Instant::now();
         let terms = value.as_ref().trim();
-        log::debug!("localsearch: query({:?})", terms);
-
         if terms.is_empty() {
             return;
         }
 
-        // Resolve limit: 0 in ctx means "unlimited"; cap at 500 for SPARQL.
-        let limit: i64 = match ctx.max_results {
+        let limit = match ctx.max_results {
             0 => 500,
             n => n as i64,
         };
 
-        let stmt = match self.statement() {
-            Some(s) => s,
-            None => {
-                log::warn!("localsearch: no connection available, skipping query");
-                return;
-            }
-        };
-        log::debug!(
-            "localsearch: statement ready at {:.1}ms",
-            t_query.elapsed().as_secs_f64() * 1000.0
-        );
+        let raw = String::from_utf8_lossy(ctx.raw_query.as_bytes());
+        let filters = extract_sparql_filters(&raw);
 
-        // Bind parameters — no string escaping needed; the tracker library
-        // handles value encoding internally.
-        stmt.bind_string("match", terms);
-        stmt.bind_int("limit", limit);
-
-        let t_exec = Instant::now();
-        let cursor = match stmt.execute(gio::Cancellable::NONE) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("localsearch: statement execute failed: {e}");
-                return;
-            }
-        };
-        log::debug!(
-            "localsearch: execute in {:.1}ms",
-            t_exec.elapsed().as_secs_f64() * 1000.0
-        );
-
-        let mut count = 0usize;
-        loop {
-            let t_next = Instant::now();
-            match cursor.next(gio::Cancellable::NONE) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::debug!(
-                        "localsearch: cursor exhausted after {count} rows; \
-                         total {:.1}ms",
-                        t_query.elapsed().as_secs_f64() * 1000.0
-                    );
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("localsearch: cursor.next error: {e}");
-                    break;
-                }
-            }
-            log::trace!(
-                "localsearch: cursor.next() row {count} in {:.2}ms",
-                t_next.elapsed().as_secs_f64() * 1000.0
-            );
-
-            // Column 0: nie:url  (file:///… URI)
-            // Column 1: nie:mimeType (may be unbound)
-            let url = match cursor.string(0) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let mime = cursor.string(1).map(|s| s.to_string());
-            // Score by row position: row 0 (best FTS rank) → 0.5, decaying.
-            // Stays in (0, 0.5] so all localsearch results rank below apps
-            // results which are in [0.8, 1.0].
-            // PDFs are scored as if they arrived PDF_ROW_ADVANCE rows earlier,
-            // so they float well above non-PDF results at nearby FTS ranks.
-            let is_pdf = mime.as_deref() == Some("application/pdf");
-            let effective_row = if is_pdf {
-                count.saturating_sub(PDF_ROW_ADVANCE)
-            } else {
-                count
-            };
-            let score = row_score(effective_row).min(0.5);
-
-            // Derive a human-readable title from the last path segment.
-            let title = url
-                .rsplit('/')
-                .next()
-                .and_then(|s| {
-                    let decoded = percent_decode(s);
-                    if decoded.is_empty() {
-                        None
-                    } else {
-                        Some(decoded)
-                    }
-                })
-                .unwrap_or_else(|| url.clone());
-
-            log::trace!(
-                "localsearch: row {count} url={url} mime={} score={score:.4}",
-                mime.as_deref().unwrap_or("(none)")
-            );
-            count += 1;
-
-            let mut result = SxResult {
-                title: stabby::option::Option::Some(SxBytes::from_str_bytes(&title)),
-                ..SxResult::new("localsearch", score)
-            };
-            meta_text(&mut result, "file_path", &url);
-            if let Some(m) = mime {
-                meta_text(&mut result, "mime", &m);
-            }
-
-            if !sender.send(result) {
-                log::debug!(
-                    "localsearch: sender closed after {count} rows at {:.1}ms",
-                    t_query.elapsed().as_secs_f64() * 1000.0
-                );
-                return;
-            }
+        if filters.is_any_active() {
+            log::debug!("localsearch: filtered query for {:?}", terms);
+            self.query_filtered(terms, limit, &filters, sender, t);
+        } else {
+            self.query_base(terms, limit, sender, t);
         }
     }
 
@@ -352,16 +357,140 @@ impl sx_plugin_api::SxHandler for LocalSearchHandler {
         stabby::option::Option::None()
     }
 
-    extern "C" fn hints(
-        &self,
-        _partial_value: stabby::str::Str<'_>,
-    ) -> sx_plugin_api::SxHints {
+    extern "C" fn hints(&self, _partial_value: stabby::str::Str<'_>) -> sx_plugin_api::SxHints {
         sx_plugin_api::SxHints::empty()
     }
 }
 
-/// Minimal percent-decode: replace `%XX` sequences with the corresponding byte.
-/// Only handles valid ASCII printable results; leaves anything else as-is.
+impl LocalSearchHandler {
+    fn query_base(&self, terms: &str, limit: i64, sender: SxResultSender, t: Instant) {
+        let Some(stmt) = self.statement() else {
+            log::warn!("localsearch: no connection");
+            return;
+        };
+        stmt.bind_string("match", terms);
+        stmt.bind_int("limit", limit);
+        run_cursor(stmt, sender, t);
+    }
+
+    fn query_filtered(
+        &self,
+        terms: &str,
+        limit: i64,
+        ff: &SpqFilters,
+        sender: SxResultSender,
+        t: Instant,
+    ) {
+        let Some(stmt) = self.filtered_statement() else {
+            log::warn!("localsearch: no filtered statement");
+            return;
+        };
+
+        let ext_active = !ff.extensions.is_empty();
+        let ext_pattern = if ext_active {
+            ff.ext_regex_pattern()
+        } else {
+            String::new()
+        };
+        stmt.bind_boolean("skip_ext", !ext_active);
+        stmt.bind_string("ext_pattern", &ext_pattern);
+
+        let mime_active = !ff.mime_contains.is_empty();
+        stmt.bind_boolean("skip_mime", !mime_active);
+        stmt.bind_string("mime_lc", &ff.mime_contains);
+
+        let path_active = !ff.path_contains.is_empty();
+        stmt.bind_boolean("skip_path", !path_active);
+        stmt.bind_string("path_lc", &ff.path_contains.to_lowercase());
+
+        let ma = ff.mtime_after_secs != 0;
+        stmt.bind_boolean("skip_mtime_after", !ma);
+        if let Ok(dt) = glib::DateTime::from_unix_utc(ff.mtime_after_secs) {
+            stmt.bind_datetime("mtime_after", &dt);
+        }
+
+        let mb = ff.mtime_before_secs != 0;
+        stmt.bind_boolean("skip_mtime_before", !mb);
+        if let Ok(dt) = glib::DateTime::from_unix_utc(ff.mtime_before_secs) {
+            stmt.bind_datetime("mtime_before", &dt);
+        }
+
+        stmt.bind_boolean("skip_size_min", ff.size_min_bytes == 0);
+        stmt.bind_int("size_min", ff.size_min_bytes);
+
+        stmt.bind_boolean("skip_size_max", ff.size_max_bytes == i64::MAX);
+        stmt.bind_int("size_max", ff.size_max_bytes);
+
+        stmt.bind_string("match", terms);
+        stmt.bind_int("limit", limit);
+        run_cursor(stmt, sender, t);
+    }
+}
+
+// ── Cursor iteration ──────────────────────────────────────────────────────────
+
+fn run_cursor(stmt: tracker::SparqlStatement, sender: SxResultSender, t: Instant) {
+    let cursor = match stmt.execute(gio::Cancellable::NONE) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("localsearch: execute failed: {e}");
+            return;
+        }
+    };
+    let mut count = 0usize;
+    loop {
+        match cursor.next(gio::Cancellable::NONE) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::debug!(
+                    "localsearch: {count} rows in {:.1}ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+                break;
+            }
+            Err(e) => {
+                log::warn!("localsearch: cursor error: {e}");
+                break;
+            }
+        }
+        let url = match cursor.string(0) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let mime = cursor.string(1).map(|s| s.to_string());
+
+        let is_pdf = mime.as_deref() == Some("application/pdf");
+        let score = row_score(if is_pdf {
+            count.saturating_sub(PDF_ROW_ADVANCE)
+        } else {
+            count
+        });
+
+        let title = url
+            .rsplit('/')
+            .next()
+            .map(percent_decode)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| url.clone());
+
+        let mut result = SxResult {
+            title: stabby::option::Option::Some(SxBytes::from_str_bytes(&title)),
+            ..SxResult::new("localsearch", score)
+        };
+        result.metadata.push(SxMetaEntry::text("file_path", &url));
+        if let Some(m) = mime {
+            result.metadata.push(SxMetaEntry::text("mime", &m));
+        }
+
+        if !sender.send(result) {
+            break;
+        }
+        count += 1;
+    }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

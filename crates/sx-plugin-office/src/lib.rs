@@ -122,6 +122,7 @@ impl sx_plugin_api::SxHandler for OfficeHandler {
             file_extensions_optional: stabby::vec::Vec::new(),
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: false,
+            is_file_index: false,
         }
     }
 

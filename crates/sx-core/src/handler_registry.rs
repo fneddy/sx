@@ -1,9 +1,7 @@
 //! Central dispatch table for `sx` handler plugins.
 //!
-//! The registry is name-agnostic: each handler declares its own conflict
-//! policy via [`SxNamespacePolicy`]; the registry enforces it uniformly.
-//!
-//! ## Namespace conflict policies
+//! Each handler declares its own conflict policy via [`SxNamespacePolicy`];
+//! the registry enforces it uniformly.
 //!
 //! | Policy | Behaviour |
 //! |--------|-----------|
@@ -24,8 +22,6 @@ use sx_plugin_api::{
     SxHandler, SxHandlerInfo, SxNamespacePolicy, SxQueryContext, SxResult, SxResultSender,
 };
 
-// ── Error types ───────────────────────────────────────────────────────────────
-
 /// Returned by [`HandlerRegistry::dispatch`] when no handler owns the namespace.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown namespace `{0}`")]
@@ -40,28 +36,21 @@ pub struct ConflictError {
     pub claimant: Box<str>,
 }
 
-// ── Registry ──────────────────────────────────────────────────────────────────
-
 /// Central dispatch table mapping namespace bytes to handler indices.
 pub struct HandlerRegistry {
     /// All registered handlers in registration order.
     handlers: Vec<Arc<dyn SxHandler>>,
-    /// namespace bytes → indices into `handlers` (>1 for Shared namespaces).
+    /// namespace → handler indices (>1 for Shared namespaces).
     index: HashMap<Box<[u8]>, Vec<usize>>,
-    /// namespace bytes → the policy declared by the first registrant.
-    /// Used to validate subsequent registrations.
+    /// Stored policy per namespace, used to validate subsequent registrations.
     policies: HashMap<Box<[u8]>, SxNamespacePolicy>,
-    /// Indices of handlers that declared `global_scope: true`.
-    /// These are invoked for every bare query term in addition to their
-    /// explicit namespace.
+    /// Indices of handlers with `global_scope: true`.
     global_handlers: Vec<usize>,
-    /// Loaded plugin libraries that must remain open for the process lifetime.
-    /// These are opaque `Box<dyn Any + Send + Sync>` so this crate doesn't need
-    /// to depend on `libloading` at the registry level — the concrete type is erased.
-    /// Keeps loaded-plugin handles alive so they are dropped after every
-    /// registered handler has been removed.  The field name is intentionally
-    /// not prefixed with `_`; the leading underscore convention in Rust means
-    /// "intentionally unused", whereas this field is used for its Drop side-effect.
+    /// Indices of handlers that have both `global_scope: true` and `is_file_index: true`.
+    /// Derived at registration time to avoid an O(n·m) cross-scan at query time.
+    global_file_index_handlers: Vec<usize>,
+    /// Loaded plugin library handles kept alive until the registry drops.
+    /// Opaque so this crate does not depend on `libloading`.
     owned_plugins: Vec<Box<dyn Any + Send + Sync>>,
 }
 
@@ -73,15 +62,14 @@ impl HandlerRegistry {
             index: HashMap::new(),
             policies: HashMap::new(),
             global_handlers: Vec::new(),
+            global_file_index_handlers: Vec::new(),
             owned_plugins: Vec::new(),
         }
     }
 
-    /// Store an opaque plugin handle so its library stays open.
+    /// Keep a plugin handle alive until the registry drops.
     ///
-    /// Called by [`crate::PluginStore::register_all`] for every plugin that
-    /// successfully registered.  The value is never read again — ownership
-    /// keeps the `.so` mapped until the registry is dropped.
+    /// The value is never read again — ownership keeps the `.so` mapped.
     pub(crate) fn keep_plugin<T: Any + Send + Sync + 'static>(&mut self, plugin: T) {
         self.owned_plugins.push(Box::new(plugin));
     }
@@ -89,26 +77,23 @@ impl HandlerRegistry {
     /// Register a handler.
     ///
     /// Calls `handler.info()` once to read the namespace, policy, and aliases.
-    ///
-    /// - `Exclusive`: first registration succeeds; any subsequent registration
-    ///   of the same namespace returns [`Err(ConflictError)`].
-    /// - `Shared`: every registration appends to the handler list; all are
-    ///   called on dispatch.
-    ///
-    /// Alias conflicts always log a warning and skip the alias; the primary
-    /// namespace registration is unaffected.
+    /// `Exclusive` namespaces reject a second registration with [`ConflictError`];
+    /// `Shared` namespaces accumulate all registrants.
+    /// Alias conflicts log a warning and skip the alias.
     pub fn register(&mut self, handler: Arc<dyn SxHandler>) -> Result<(), ConflictError> {
         let info: SxHandlerInfo = handler.info();
         let ns = info.namespace.as_str().to_owned();
         let policy = info.namespace_policy;
 
-        // Validate before pushing so a ConflictError leaves the registry
-        // consistent — no orphaned handler that `default_file_extensions()` would count.
+        // Validate first — a ConflictError must leave the registry untouched.
         let idx = self.handlers.len();
         self.insert_namespace(ns.as_bytes(), idx, &ns, &policy)?;
 
         if info.global_scope {
             self.global_handlers.push(idx);
+        }
+        if info.global_scope && info.is_file_index {
+            self.global_file_index_handlers.push(idx);
         }
 
         self.handlers.push(handler);
@@ -135,13 +120,9 @@ impl HandlerRegistry {
 
     /// Dispatch a query token to all handlers registered for `namespace`.
     ///
-    /// Every matching handler receives `value`, `ctx`, and a forwarding sender
-    /// that writes into the same result stream as `sender`.
     /// Returns [`Err(UnknownNamespace)`] if no handler owns the namespace.
-    ///
-    /// If a handler panics while holding the shared sender lock, the lock is
-    /// poisoned; subsequent sends log a warning and return `false` (stop) to
-    /// the handler rather than propagating the panic.
+    /// If a handler panics while holding the shared sender lock, subsequent sends
+    /// log a warning and return `false` rather than propagating the panic.
     pub fn dispatch(
         &self,
         namespace: &[u8],
@@ -154,8 +135,8 @@ impl HandlerRegistry {
             .get(namespace)
             .ok_or_else(|| UnknownNamespace(String::from_utf8_lossy(namespace).into()))?;
 
-        // Wrap in Arc<Mutex<…>> so multiple handlers (Shared namespace) can
-        // forward into the same stream without SxResultSender: Clone.
+        // Arc<Mutex<…>> lets Shared-namespace handlers forward into the same stream
+        // without requiring SxResultSender: Clone.
         let shared = Arc::new(Mutex::new(sender));
         let value_str = sx_plugin_api::stabby::str::Str::from(value);
 
@@ -173,10 +154,9 @@ impl HandlerRegistry {
         Ok(())
     }
 
-    /// Returns the union of `file_extensions` (default-on) across all registered handlers.
+    /// Returns the union of default `file_extensions` across all registered handlers.
     ///
-    /// Used to build the automatic walk-tier Ext allow-list when no `ext:` filter
-    /// is present in the query. Non-file handlers contribute nothing.
+    /// Used to build the automatic walk-tier Ext allow-list when no `ext:` filter is present.
     pub fn default_file_extensions(&self) -> HashSet<Box<[u8]>> {
         let mut out = HashSet::new();
         for handler in &self.handlers {
@@ -188,17 +168,17 @@ impl HandlerRegistry {
         out
     }
 
-    /// Returns the union of **all** extensions any registered handler can
-    /// process — both `file_extensions` (default-on) and
-    /// `file_extensions_optional` (opt-in).
+    /// Returns the union of all extensions any registered handler can process
+    /// (both default and optional).
     ///
-    /// Used to validate user-supplied `ext:` filters: if the user writes
-    /// `ext:gz` and no handler claims `.gz` in either list, a warning can be
-    /// surfaced at parse time.
+    /// Used to validate user-supplied `ext:` filters.
     pub fn all_file_extensions(&self) -> HashSet<Box<[u8]>> {
-        let mut out = self.default_file_extensions();
+        let mut out = HashSet::new();
         for handler in &self.handlers {
             let info = handler.info();
+            for ext in info.file_extensions.as_slice() {
+                out.insert(ext.as_bytes().into());
+            }
             for ext in info.file_extensions_optional.as_slice() {
                 out.insert(ext.as_bytes().into());
             }
@@ -211,14 +191,12 @@ impl HandlerRegistry {
         self.index.contains_key(ns)
     }
 
-    /// Returns a snapshot of `SxHandlerInfo` for every registered handler,
-    /// in registration order.  Used by the UI to build the quick-reference panel.
+    /// Snapshot of `SxHandlerInfo` for every registered handler, in registration order.
     pub fn handlers_info(&self) -> Vec<SxHandlerInfo> {
         self.handlers.iter().map(|h| h.info()).collect()
     }
 
-    /// Returns all registered namespace strings.
-    /// Used by the UI for namespace-prefix tab-completion.
+    /// All registered namespace strings (for tab-completion).
     pub fn namespaces(&self) -> Vec<String> {
         self.index
             .keys()
@@ -226,9 +204,7 @@ impl HandlerRegistry {
             .collect()
     }
 
-    /// Call `hints()` on all handlers registered for `namespace` and collect
-    /// results as `(label, completion)` string pairs.
-    /// Returns an empty vec if the namespace is unknown.
+    /// Call `hints()` on all handlers for `namespace` and return `(label, completion)` pairs.
     pub fn hints_for_namespace(&self, ns: &[u8], partial_value: &str) -> Vec<(String, String)> {
         let Some(indices) = self.index.get(ns) else {
             log::debug!(
@@ -257,8 +233,7 @@ impl HandlerRegistry {
         out
     }
 
-    /// Return the static `value_hint` string from the first handler registered
-    /// for `namespace`, or an empty string if the namespace is unknown.
+    /// Return the static `value_hint` from the first handler for `namespace`.
     pub fn value_hint_for_namespace(&self, ns: &[u8]) -> String {
         let Some(indices) = self.index.get(ns) else {
             return String::new();
@@ -266,12 +241,10 @@ impl HandlerRegistry {
         self.handlers[indices[0]].info().value_hint.as_str().to_owned()
     }
 
-    /// Returns the namespace bytes of every handler that declared
-    /// `global_scope: true`, in registration order.
+    /// Namespace bytes of every handler with `global_scope: true`, in registration order.
     ///
-    /// The parser uses this to synthesise a `HandlerToken` per global handler
-    /// for every bare query term so those handlers are invoked alongside the
-    /// normal file-walk.
+    /// The parser synthesises a `HandlerToken` per global handler for every bare
+    /// query term so those handlers are invoked alongside the file walk.
     pub fn global_namespaces(&self) -> Vec<Box<[u8]>> {
         self.global_handlers
             .iter()
@@ -282,9 +255,27 @@ impl HandlerRegistry {
             .collect()
     }
 
-    /// Returns all handlers that declared at least one default file extension
-    /// (i.e. file handlers).  Used by `compile_with_registry` to build the
-    /// per-invocation `SxExtractorHandle` list.
+    /// Global-scope namespaces restricted to file-index handlers (`is_file_index: true`).
+    pub fn global_file_index_namespaces(&self) -> Vec<Box<[u8]>> {
+        self.global_file_index_handlers
+            .iter()
+            .map(|&idx| {
+                let ns = self.handlers[idx].info().namespace;
+                Box::from(ns.as_bytes())
+            })
+            .collect()
+    }
+
+    /// Build the [`NamespaceContext`] that the `sx-parser` grammar needs.
+    pub fn namespace_context(&self) -> sx_parser::NamespaceContext {
+        sx_parser::NamespaceContext {
+            known: self.index.keys().cloned().collect(),
+            global: self.global_namespaces(),
+            global_file_index: self.global_file_index_namespaces(),
+        }
+    }
+
+    /// All file handlers (those with at least one declared extension).
     pub fn file_handlers(&self) -> Vec<Arc<dyn SxHandler>> {
         self.handlers
             .iter()
@@ -297,11 +288,7 @@ impl HandlerRegistry {
             .collect()
     }
 
-    // ── private ───────────────────────────────────────────────────────────────
-
-    /// Insert `idx` into the namespace index for `ns`, honouring the stored
-    /// policy of the first registrant (no prior → insert; Exclusive → error;
-    /// Shared → append).
+    /// Insert `idx` into the namespace index for `ns`, honouring the stored policy.
     fn insert_namespace(
         &mut self,
         ns: &[u8],

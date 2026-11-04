@@ -1,11 +1,8 @@
 use std::fs;
 use std::io::Write;
+use sx_core::QueryCompileExt;
 
 // ── Extractor tests ───────────────────────────────────────────────────────────
-//
-// Previously these tested `sx_core::extractor_for` directly.  In Phase 6 the
-// extractor logic moved into `sx-plugin-text` / `sx-plugin-pdf` / `sx-plugin-office`.
-// These tests now exercise the plugin `SxExtractorHandle` API directly.
 
 #[test]
 fn text_handler_extracts_compressed_text_files() {
@@ -98,7 +95,7 @@ fn search_matches_any_term() {
     fs::write(dir.path().join("has-hashmap.md"), "hashmap only").unwrap();
     fs::write(dir.path().join("has-serde.md"), "serde only").unwrap();
 
-    let cq = sx_core::Query::builder()
+    let cq = sx_core::QueryBuilder::new()
         .root(dir.path())
         .and_filter(sx_core::Filter::Or(vec![
             sx_core::Filter::Content(sx_core::MatchExpr::exact("hashmap")),
@@ -119,7 +116,7 @@ fn search_without_patterns_returns_all_files() {
     fs::write(dir.path().join("also.md"), "anything else").unwrap();
 
     // No content filter → walk-only, all files match.
-    let cq = sx_core::Query::builder()
+    let cq = sx_core::QueryBuilder::new()
         .root(dir.path())
         .build()
         .unwrap()
@@ -131,8 +128,7 @@ fn search_without_patterns_returns_all_files() {
 
 #[test]
 fn search_collects_offsets_from_all_matches() {
-    // offsets field is currently always empty in CompiledQuery (Step 8 will
-    // populate it); this test verifies the file is found and extracted OK.
+    // offsets field is always empty; verifies file is found and extracted.
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("multi.md"),
@@ -140,7 +136,7 @@ fn search_collects_offsets_from_all_matches() {
     )
     .unwrap();
 
-    let cq = sx_core::Query::builder()
+    let cq = sx_core::QueryBuilder::new()
         .root(dir.path())
         .and_filter(sx_core::Filter::Or(vec![
             sx_core::Filter::Content(sx_core::MatchExpr::exact("foo")),
@@ -157,12 +153,11 @@ fn search_collects_offsets_from_all_matches() {
 
 #[test]
 fn keep_content_carries_bytes_on_match() {
-    // CompiledQuery::Match.content is always None currently (Step 8).
-    // Verify the match is found and extracted correctly.
+    // Match.content is always None; verifies the file is found and content extracted.
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.md"), "hello world").unwrap();
 
-    let cq = sx_core::Query::builder()
+    let cq = sx_core::QueryBuilder::new()
         .root(dir.path())
         .content("hello")
         .build()

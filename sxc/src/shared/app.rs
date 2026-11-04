@@ -45,10 +45,7 @@ impl App {
         self.results.append(&mut self.pending);
         self.results.sort_by(|a, b| {
             // Primary: descending score.
-            let ord = b
-                .score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let ord = b.score.total_cmp(&a.score);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }

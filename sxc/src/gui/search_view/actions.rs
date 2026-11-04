@@ -54,7 +54,13 @@ impl SearchView {
 
     /// If a search is running: stop it and refocus the input.
     /// If the input is empty: quit.
-    /// Otherwise: clear the input.
+    /// Otherwise: clear the input and reset results so the reference panel
+    /// shows again.
+    ///
+    /// NOTE: `InputState::set_value` suppresses `InputEvent::Change`, so the
+    /// normal `start_live_search` subscriber never fires after `clear_input`.
+    /// We call `start_live_search` ourselves so the empty-query path runs and
+    /// the list is cleared.
     pub(super) fn on_cancel(
         &mut self,
         _: &Cancel,
@@ -72,6 +78,9 @@ impl SearchView {
             cx.quit();
         } else {
             self.clear_input(window, cx);
+            // set_value does not emit InputEvent::Change, so drive the
+            // empty-query reset manually.
+            self.start_live_search(cx);
         }
     }
 

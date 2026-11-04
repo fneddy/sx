@@ -17,16 +17,12 @@ pub enum Compression {
 impl Compression {
     /// Detect compression from a file extension (case-insensitive).
     pub fn from_ext(ext: &str) -> Self {
-        if ext.eq_ignore_ascii_case("gz") {
-            Compression::Gzip
-        } else if ext.eq_ignore_ascii_case("xz") {
-            Compression::Xz
-        } else if ext.eq_ignore_ascii_case("bz2") {
-            Compression::Bzip2
-        } else if ext.eq_ignore_ascii_case("zst") || ext.eq_ignore_ascii_case("zstd") {
-            Compression::Zstd
-        } else {
-            Compression::None
+        match ext.to_ascii_lowercase().as_str() {
+            "gz"           => Compression::Gzip,
+            "xz"           => Compression::Xz,
+            "bz2"          => Compression::Bzip2,
+            "zst" | "zstd" => Compression::Zstd,
+            _              => Compression::None,
         }
     }
 

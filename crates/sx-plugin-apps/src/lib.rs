@@ -15,7 +15,7 @@ use gio::glib::object::Cast;
 use gio::prelude::AppInfoExt;
 use std::time::Instant;
 use sx_plugin_api::{
-    meta_icon_png, meta_text, stabby, SxBytes, SxHandlerInfo, SxNamespacePolicy, SxQueryContext,
+    stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext,
     SxResult, SxResultSender,
 };
 
@@ -162,6 +162,51 @@ fn app_symbol(id: &str) -> &'static str {
     }
 }
 
+// ── App filtering ─────────────────────────────────────────────────────────────
+
+/// A single application that matches the current query, with its display
+/// fields and relevance score pre-computed.
+struct AppMatch {
+    app: gio::AppInfo,
+    name: String,
+    id: String,
+    score: f64,
+}
+
+/// Return all installed apps that match `query`, ordered by insertion order.
+///
+/// Filters out apps that have opted out of launcher display (`should_show`).
+/// When `query` is empty every visible app gets a default score of `0.9`.
+fn filter_apps(query: &str) -> Vec<AppMatch> {
+    let query_lc = query.trim().to_ascii_lowercase();
+    gio::AppInfo::all()
+        .into_iter()
+        .filter(|app| app.should_show())
+        .filter_map(|app| {
+            let name = app.name().to_string();
+            let id = app.id().map(|s| s.to_string()).unwrap_or_default();
+            let desc = app.description().map(|s| s.to_string()).unwrap_or_default();
+            let name_lc = name.to_ascii_lowercase();
+            let id_lc = id.to_ascii_lowercase();
+            let desc_lc = desc.to_ascii_lowercase();
+            let score = if query_lc.is_empty() {
+                0.9
+            } else if name_lc.starts_with(&query_lc) {
+                1.0
+            } else if name_lc.contains(&query_lc) {
+                0.9
+            } else if id_lc.contains(&query_lc) {
+                0.8
+            } else if desc_lc.contains(&query_lc) {
+                0.7
+            } else {
+                return None;
+            };
+            Some(AppMatch { app, name, id, score })
+        })
+        .collect()
+}
+
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// Installed-application search handler.
@@ -194,6 +239,7 @@ impl sx_plugin_api::SxHandler for AppsHandler {
             file_extensions_optional: stabby::vec::Vec::new(),
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: true,
+            is_file_index: false,
         }
     }
 
@@ -207,58 +253,32 @@ impl sx_plugin_api::SxHandler for AppsHandler {
         let query = value.as_ref().trim().to_lowercase();
         log::debug!("apps: query({:?})", query);
 
-        let all = gio::AppInfo::all();
-        log::debug!("apps: {} installed applications", all.len());
+        let matches = filter_apps(&query);
+        log::debug!("apps: {} matching applications", matches.len());
 
         let mut sent = 0usize;
-        let mut skipped_match = 0usize;
-        let mut skipped_show = 0usize;
         let mut skipped_icon = 0usize;
 
-        for app in all {
-            // Skip apps that explicitly opt out of launcher display.
-            if !app.should_show() {
-                skipped_show += 1;
-                continue;
-            }
-
-            let name = app.name().to_string();
-            let id = app.id().map(|s| s.to_string()).unwrap_or_default();
-            let name_lc = name.to_ascii_lowercase();
-            let id_lc = id.to_ascii_lowercase();
-
-            let score = if query.is_empty() {
-                0.9
-            } else if name_lc.starts_with(&query) {
-                1.0
-            } else if name_lc.contains(&query) {
-                0.9
-            } else if id_lc.contains(&query) {
-                0.8
-            } else {
-                skipped_match += 1;
-                continue;
-            };
-
+        for m in matches {
             // Icon — skip apps with no resolvable icon.
-            let png = match app.icon().as_ref().and_then(icon_png) {
+            let png = match m.app.icon().as_ref().and_then(icon_png) {
                 Some(p) => p,
                 None => {
-                    log::trace!("apps: no icon for {:?} (id={}), skipping", name, id);
+                    log::trace!("apps: no icon for {:?} (id={}), skipping", m.name, m.id);
                     skipped_icon += 1;
                     continue;
                 }
             };
 
-            log::debug!("apps: sending {:?} id={} score={}", name, id, score);
+            log::debug!("apps: sending {:?} id={} score={}", m.name, m.id, m.score);
 
             let mut result = SxResult {
-                title: stabby::option::Option::Some(SxBytes::from_str_bytes(&name)),
-                ..SxResult::new("apps", score)
+                title: stabby::option::Option::Some(SxBytes::from_str_bytes(&m.name)),
+                ..SxResult::new("apps", m.score)
             };
-            meta_icon_png(&mut result, png);
-            meta_text(&mut result, "icon_symbol", app_symbol(&id));
-            meta_text(&mut result, "gio_id", &id);
+            result.metadata.push(SxMetaEntry::bytes("icon_png", png));
+            result.metadata.push(SxMetaEntry::text("icon_symbol", app_symbol(&m.id)));
+            result.metadata.push(SxMetaEntry::text("gio_id", &m.id));
 
             if !sender.send(result) {
                 log::debug!(
@@ -271,8 +291,7 @@ impl sx_plugin_api::SxHandler for AppsHandler {
         }
 
         log::debug!(
-            "apps: done — sent={sent} skipped_show={skipped_show} \
-             skipped_match={skipped_match} skipped_icon={skipped_icon} ({:.1}ms)",
+            "apps: done — sent={sent} skipped_icon={skipped_icon} ({:.1}ms)",
             t.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -292,25 +311,12 @@ impl sx_plugin_api::SxHandler for AppsHandler {
             // Too many apps to list all — wait until the user starts typing.
             return sx_plugin_api::SxHints::empty();
         }
-        let all = gio::AppInfo::all();
         let mut items = stabby::vec::Vec::new();
-        let mut count = 0usize;
-        for app in &all {
-            if !app.should_show() {
-                continue;
-            }
-            let name = app.name().to_string();
-            let name_lc = name.to_ascii_lowercase();
-            if name_lc.starts_with(&query) || name_lc.contains(&query) {
-                items.push(sx_plugin_api::SxHintEntry {
-                    label:      SxBytes::from_str_bytes(&name),
-                    completion: SxBytes::from_str_bytes(&name),
-                });
-                count += 1;
-                if count >= 5 {
-                    break;
-                }
-            }
+        for m in filter_apps(&query).into_iter().take(5) {
+            items.push(sx_plugin_api::SxHintEntry {
+                label:      SxBytes::from_str_bytes(&m.name),
+                completion: SxBytes::from_str_bytes(&m.name),
+            });
         }
         sx_plugin_api::SxHints { items }
     }

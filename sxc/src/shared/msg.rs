@@ -1,16 +1,26 @@
+//! Post-FFI message types for search results delivered to the UI.
+//!
+//! `sx-plugin-api` defines the ABI-stable, pointer-based types (`SxResult`,
+//! `SxMetaValue`, …) that plugins write across the shared-library boundary.
+//! The types in this module are their owned, host-side equivalents:
+//!
+//! | Plugin-API (ABI-stable)       | This module (owned)  |
+//! |-------------------------------|----------------------|
+//! | `SxMetaValue`                 | `MetaValue`          |
+//! | `SxResult`                    | `ResultMsg`          |
+//!
+//! The conversion happens in `From<SxResult> for ResultMsg`.  Any change to
+//! `SxResult` / `SxMetaValue` in `sx-plugin-api` must be mirrored here and in
+//! that `From` impl.
+
+use std::collections::HashMap;
+
 /// The value of a metadata entry — mirrors [`sx_plugin_api::SxMetaValue`].
 #[derive(Debug, Clone)]
 pub enum MetaValue {
     Text(String),
     Number(f64),
     Bytes(Vec<u8>),
-}
-
-/// A single metadata entry — mirrors [`sx_plugin_api::SxMetaEntry`].
-#[derive(Debug, Clone)]
-pub struct MetaEntry {
-    pub key: String,
-    pub value: MetaValue,
 }
 
 /// A single search result delivered to the UI — mirrors [`sx_plugin_api::SxResult`].
@@ -21,56 +31,47 @@ pub struct ResultMsg {
     pub namespace: String,
     pub score: f64,
     pub title: Option<String>,
-    pub metadata: Vec<MetaEntry>,
+    pub metadata: HashMap<String, MetaValue>,
 }
 
 impl ResultMsg {
     /// Construct a plain file-hit result from a path and a normalised score.
     pub fn from_file(path: String, score: f64) -> Self {
+        let mut metadata = HashMap::new();
+        metadata.insert("file_path".to_owned(), MetaValue::Text(path.clone()));
         Self {
             namespace: "file".to_owned(),
             score,
-            title: Some(path.clone()),
-            metadata: vec![MetaEntry {
-                key: "file_path".to_owned(),
-                value: MetaValue::Text(path),
-            }],
+            title: Some(path),
+            metadata,
         }
     }
 
     /// Look up a text metadata value by key. Returns `None` for missing keys
     /// or non-`Text` values.
     pub fn meta(&self, key: &str) -> Option<&str> {
-        self.metadata.iter().find(|e| e.key == key).and_then(|e| {
-            if let MetaValue::Text(s) = &e.value {
-                Some(s.as_str())
-            } else {
-                None
-            }
-        })
+        match self.metadata.get(key) {
+            Some(MetaValue::Text(s)) => Some(s.as_str()),
+            _ => None,
+        }
     }
 
     /// Look up a raw-bytes metadata value by key (e.g. `"icon_png"`).
     pub fn meta_bytes(&self, key: &str) -> Option<&[u8]> {
-        self.metadata.iter().find(|e| e.key == key).and_then(|e| {
-            if let MetaValue::Bytes(b) = &e.value {
-                Some(b.as_slice())
-            } else {
-                None
-            }
-        })
+        match self.metadata.get(key) {
+            Some(MetaValue::Bytes(b)) => Some(b.as_slice()),
+            _ => None,
+        }
     }
 
     /// Look up a numeric metadata value by key.
     pub fn meta_number(&self, key: &str) -> Option<f64> {
-        self.metadata.iter().find(|e| e.key == key).and_then(|e| {
-            if let MetaValue::Number(n) = &e.value {
-                Some(*n)
-            } else {
-                None
-            }
-        })
+        match self.metadata.get(key) {
+            Some(MetaValue::Number(n)) => Some(*n),
+            _ => None,
+        }
     }
+
     /// Returns `true` when the result carries no displayable content.
     pub fn is_empty(&self) -> bool {
         self.title.is_none() && self.metadata.is_empty()
@@ -83,7 +84,7 @@ impl From<sx_plugin_api::SxResult> for ResultMsg {
         let score = res.score;
         let title = res.title.match_owned(|b| Some(b.into_string()), || None);
 
-        let metadata: Vec<MetaEntry> = res
+        let metadata: HashMap<String, MetaValue> = res
             .metadata
             .into_iter()
             .map(|e| {
@@ -93,7 +94,7 @@ impl From<sx_plugin_api::SxResult> for ResultMsg {
                     |n| MetaValue::Number(n),
                     |b| MetaValue::Bytes(b.into_vec()),
                 );
-                MetaEntry { key, value }
+                (key, value)
             })
             .collect();
 

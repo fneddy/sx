@@ -1,6 +1,37 @@
-use crate::error::ParseError;
+//! Query language AST types, shared between `sx-core` and file-index plugins.
+
 use std::path::PathBuf;
 use time::OffsetDateTime;
+
+/// Errors produced by `Query::from_str` / `Query::from_str_with_context`.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ParseError {
+    #[error("unknown namespace `{token}`")]
+    UnknownNamespace { token: String },
+
+    #[error("invalid value `{value}` for namespace `{namespace}`: {reason}")]
+    InvalidValue {
+        namespace: String,
+        value: String,
+        reason: String,
+    },
+
+    #[error("malformed combinator: `{raw}`")]
+    MalformedCombinator { raw: String },
+
+    #[error("empty query")]
+    EmptyQuery,
+}
+
+/// Parser's view of registered namespaces, passed in from `sx-core` at query time.
+#[derive(Debug, Default, Clone)]
+pub struct NamespaceContext {
+    pub known: Vec<Box<[u8]>>,
+    pub global: Vec<Box<[u8]>>,
+    /// Subset of `global` with `is_file_index = true`. Used when the query has
+    /// file-system-only filters so entity-search handlers are never invoked.
+    pub global_file_index: Vec<Box<[u8]>>,
+}
 
 /// A byte-string match expression: value and optional negation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +66,10 @@ pub enum RangeExpr<T> {
 
 /// Nanoseconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(pub(crate) u64);
+pub struct Timestamp(pub u64);
 
 impl Timestamp {
-    pub(crate) fn from_offset_dt(dt: OffsetDateTime) -> Self {
+    pub fn from_offset_dt(dt: OffsetDateTime) -> Self {
         Self(dt.unix_timestamp_nanos().max(0) as u64)
     }
 
@@ -47,14 +78,12 @@ impl Timestamp {
     }
 
     pub fn days_ago(n: u64) -> Self {
-        // Saturate at i64::MAX days (~25 billion years) rather than wrapping.
         let days = n.min(i64::MAX as u64) as i64;
         let dt = OffsetDateTime::now_utc() - time::Duration::days(days);
         Self::from_offset_dt(dt)
     }
 
     pub fn weeks_ago(n: u64) -> Self {
-        // Saturate at i64::MAX weeks rather than wrapping.
         let weeks = n.min(i64::MAX as u64) as i64;
         let dt = OffsetDateTime::now_utc() - time::Duration::weeks(weeks);
         Self::from_offset_dt(dt)
@@ -121,7 +150,6 @@ impl Timestamp {
             .unwrap_or_else(OffsetDateTime::now_utc);
         Self::from_offset_dt(tomorrow)
     }
-
 }
 
 impl std::str::FromStr for Timestamp {
@@ -151,12 +179,14 @@ impl std::str::FromStr for Timestamp {
                 return Ok(Self::months_ago(n * 12));
             }
         }
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() == 3 {
+        let mut it = s.splitn(4, '-');
+        if let (Some(y_s), Some(m_s), Some(d_s), None) =
+            (it.next(), it.next(), it.next(), it.next())
+        {
             if let (Ok(y), Ok(m), Ok(d)) = (
-                parts[0].parse::<i32>(),
-                parts[1].parse::<u8>(),
-                parts[2].parse::<u8>(),
+                y_s.parse::<i32>(),
+                m_s.parse::<u8>(),
+                d_s.parse::<u8>(),
             ) {
                 return Self::from_date(y, m, d);
             }
@@ -214,7 +244,7 @@ pub enum MetaValue {
     Bool(bool),
 }
 
-/// The recursive filter AST. Walk-tier leaves need no file open; content-tier
+/// The recursive filter AST.  Walk-tier leaves need no file open; content-tier
 /// leaves require extraction.  Combinator nodes may span both tiers; the
 /// partition into `walk_filter`/`content_filter` is automatic at compile time.
 #[derive(Debug, Clone, PartialEq)]
@@ -229,7 +259,7 @@ pub enum Filter {
     Modified(RangeExpr<Timestamp>),
     Created(RangeExpr<Timestamp>),
     Accessed(RangeExpr<Timestamp>),
-    /// Walk-tier: `File/Dir/Symlink/Empty`. Content-tier: `Executable/Binary/Text`.
+    /// Walk-tier: `File/Dir/Symlink/Empty`.  Content-tier: `Executable/Binary/Text`.
     Type(FileType),
     /// Exact octal permission check: `(mode & 0o7777) == value`.
     PermOctal(u32),
@@ -250,11 +280,11 @@ pub enum Filter {
     Or(Vec<Filter>),
     Not(Box<Filter>),
 
-    /// Always true. Identity for an empty walk or content filter.
+    /// Always true.  Identity for an empty walk or content filter.
     Any,
 }
 
-/// Walk execution options. Not part of the filter predicate.
+/// Walk execution options.  Not part of the filter predicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     /// `None` = unlimited depth.
@@ -302,10 +332,7 @@ pub struct HandlerToken {
     pub value: Box<[u8]>,
 }
 
-/// Top-level query. Immutable once constructed.
-///
-/// Partitioned into `walk_filter` (stat-only) and `content_filter` (requires
-/// file read) at compile time; callers don't manage the split.
+/// Top-level query. Pre-partitioned into `walk_filter` and `content_filter` at parse time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub roots: Vec<PathBuf>,
@@ -313,10 +340,6 @@ pub struct Query {
     pub content_filter: Filter,
     pub options: SearchOptions,
     pub handler_tokens: Vec<HandlerToken>,
-}
-
-impl Query {
-    pub fn builder() -> crate::query_builder::QueryBuilder {
-        crate::query_builder::QueryBuilder::new()
-    }
+    /// Verbatim query string, passed to file-index plugins for their own parsing.
+    pub raw_query: String,
 }

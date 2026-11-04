@@ -10,12 +10,10 @@ use gpui::{
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::h_flex;
 
-// ── Row data ──────────────────────────────────────────────────────────────────
-
 /// What happens when a row is activated.
 ///
-/// Marked `#[non_exhaustive]` so new activation kinds can be added without
-/// breaking exhaustive `match` arms in downstream code.
+/// `#[non_exhaustive]` so new activation kinds can be added without breaking
+/// existing exhaustive `match` arms.
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum ActionKind {
@@ -33,8 +31,8 @@ impl ActionKind {
 
 /// Display data for one result row.
 ///
-/// Marked `#[non_exhaustive]` so new display fields can be added without
-/// forcing all construction sites to be updated simultaneously.
+/// `#[non_exhaustive]` so new display fields can be added without forcing all
+/// construction sites to update at once.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct RowData {
@@ -47,13 +45,9 @@ pub struct RowData {
 
 const ICON_SIZE: f32 = 1.75; // rems
 
-// ── ResultList entity ─────────────────────────────────────────────────────────
-
 pub struct ResultList {
     rows: Vec<RowData>,
-    /// Stable per-row identity, parallel to `rows`.
-    /// Each call to `insert` consumes one id from `next_id`; ids are never
-    /// reused across a `clear()` so reinserted items always get fresh identity.
+    /// Stable per-row ids, parallel to `rows`. Never reused across `clear()` calls.
     ids: Vec<u64>,
     next_id: u64,
     selected: Option<usize>,
@@ -81,8 +75,8 @@ impl ResultList {
         self.rows.is_empty()
     }
 
-    /// Insert a row at `index`, assigning it a stable unique id.
-    /// Adjusts the selection index so the same row stays selected after insertion.
+    /// Insert a row at `index`. Adjusts the selection so the same row stays
+    /// highlighted after insertion.
     pub fn insert(&mut self, index: usize, row: RowData) {
         if let Some(sel) = self.selected {
             if index <= sel {
@@ -98,8 +92,8 @@ impl ResultList {
     pub fn clear(&mut self) {
         self.rows.clear();
         self.ids.clear();
-        // next_id is intentionally NOT reset: ids must remain unique across
-        // repeated clear/insert cycles within the same ResultList lifetime.
+        // next_id intentionally not reset — ids must remain unique across
+        // clear/insert cycles within the same ResultList lifetime.
         self.selected = None;
     }
 
@@ -154,10 +148,7 @@ impl Render for ResultList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
 
-        // Derive row height from the current rem size so the list scales
-        // correctly when the user (or accessibility settings) changes the base
-        // font.  3 rem gives a comfortable two-line row at the default 16 px
-        // rem and remains proportional at any other size.
+        // 3 rem gives a two-line row at default 16 px and scales with rem.
         let row_h = window.rem_size() * 3.0;
 
         let list = uniform_list(
@@ -167,13 +158,12 @@ impl Render for ResultList {
                 range
                     .map(|ix| {
                         let row = this.rows[ix].clone();
-                        // Use the stable domain id, not the mutable position index,
-                        // so GPUI preserves per-row state (hover, focus, animation)
-                        // when items are reordered by incoming higher-scored results.
+                        // Use the stable domain id, not the mutable position index, so
+                        // GPUI preserves per-row state when items are reordered by
+                        // incoming higher-scored results.
                         let id = this.ids[ix];
                         let is_selected = selected == Some(ix);
 
-                        // ── Icon / symbol ─────────────────────────────────────
                         let icon_el: Option<gpui::AnyElement> = if let Some(image) = row.icon {
                             Some(
                                 div()
@@ -200,7 +190,6 @@ impl Render for ResultList {
                             })
                         };
 
-                        // ── Label + sub-label ─────────────────────────────────
                         let text = div()
                             .flex()
                             .flex_col()
@@ -213,11 +202,8 @@ impl Render for ResultList {
                                 d.child(div().truncate().text_sm().child(sub))
                             });
 
-                        // ── Single horizontal flex row as the ListItem child ──
-                        // ListItem wraps all children in `div().w_full().children(…)`
-                        // which is a block (non-flex) div.  Passing icon + text as
-                        // separate children would stack them vertically.  Instead we
-                        // compose them into one `h_flex` row so they sit side-by-side.
+                        // ListItem wraps children in a block div — compose icon + text
+                        // into one h_flex so they sit side-by-side rather than stacking.
                         let row_content = h_flex()
                             .w_full()
                             .h(row_h)

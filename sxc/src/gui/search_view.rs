@@ -1,14 +1,9 @@
-//! `SearchView` — the root GPUI component for the sxp launcher window.
+//! `SearchView` — root GPUI component for the sxp launcher window.
 //!
-//! The file is intentionally kept to struct definition + wiring + rendering.
-//! The three concerns that would otherwise bloat it live next to it as sibling
-//! submodule files in the `search_view/` directory:
-//!
-//! | File          | Responsibility                                        |
-//! |---------------|-------------------------------------------------------|
-//! | `hints.rs`    | `HintState` — inline Tab-completion                   |
-//! | `search.rs`   | `StatusBar` model + live-search and full-search execution |
-//! | `actions.rs`  | Keyboard-action handlers (Enter, Esc, ↑/↓, Tab)      |
+//! Sibling submodules:
+//! * `hints.rs` — `HintState` (inline Tab-completion)
+//! * `search.rs` — `StatusBar` + live/full-search execution
+//! * `actions.rs` — keyboard-action handlers
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,12 +20,11 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+use gpui_kit::component::ActiveTheme;
 
 use sx_core::HandlerRegistry;
 use sx_plugin_api::SxHandlerInfo;
 
-use crate::shared::msg::ResultMsg;
 use crate::shared::search::SearchHandle;
 
 use super::result_list::ResultList;
@@ -43,17 +37,12 @@ mod actions;
 mod hints;
 mod search;
 
-// ── Actions ───────────────────────────────────────────────────────────────────
-
 actions!(sxp, [Submit, Cancel, NavUp, NavDown, AcceptHint]);
 
 pub const KEY_CONTEXT: &str = "SxpSearch";
 
-/// How many `ResultMsg`s are drained from the channel in a single GPUI task
-/// iteration before yielding back to the event loop.
+/// Results drained from the channel per GPUI task iteration before yielding.
 const BATCH: usize = 256;
-
-// ── Struct ────────────────────────────────────────────────────────────────────
 
 pub struct SearchView {
     registry: Option<Arc<HandlerRegistry>>,
@@ -68,11 +57,7 @@ pub struct SearchView {
     session: Option<SearchHandle>,
     search_task: Option<Task<()>>,
     live_search_task: Option<Task<()>>,
-    /// RAII guard that cancels live-search `spawn_blocking` tasks.
-    ///
-    /// Dropping this (setting it to `None`) fires the live search's
-    /// `CancellationToken`, which causes the plugin `SxResultSender` callbacks
-    /// to return `false` immediately — no explicit `.cancel()` call needed.
+    /// Dropping this fires the live search's `CancellationToken` via RAII.
     _live_search_guard: Option<DropGuard>,
     _loader_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -81,13 +66,9 @@ pub struct SearchView {
     hints: HintState,
 }
 
-// ── Constructor ───────────────────────────────────────────────────────────────
-
 impl SearchView {
-    /// `registry_rx` is a one-shot receiver for the `HandlerRegistry` that was
-    /// started loading in the background before GPUI opened the window.
-    /// Receiving it here instead of the raw `plugin_dirs` means plugin loading
-    /// overlaps with GPU shader compilation (≈80 % of cold-start time).
+    /// `registry_rx` receives the registry loaded in the background before the
+    /// window opened, so plugin loading overlaps with GPU shader compilation.
     pub fn new(
         registry_rx: oneshot::Receiver<Arc<HandlerRegistry>>,
         root: PathBuf,
@@ -95,10 +76,8 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search… (↵ deep search)"));
-
         let list = cx.new(|cx| ResultList::new(cx));
 
-        // Keyboard-driven live search: fire on every input change.
         let input_sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _window, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.update_hints(cx);
@@ -106,10 +85,8 @@ impl SearchView {
             }
         });
 
-        // Focus the input immediately so the user can type without clicking.
         input.update(cx, |state, cx| state.focus(window, cx));
 
-        // Await the registry that was loading in the background.
         let loader_task = cx.spawn(async move |this, cx| {
             if let Ok(reg) = registry_rx.await {
                 let _ = this.update(cx, |view, cx| {
@@ -161,8 +138,6 @@ impl SearchView {
     }
 }
 
-// ── Focusable ─────────────────────────────────────────────────────────────────
-
 impl Focusable for SearchView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
@@ -170,27 +145,20 @@ impl Focusable for SearchView {
 }
 
 impl SearchView {
-    fn sync_loading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let loading = self.status_bar(cx).is_running();
+    /// Keep the input widget's loading indicator in sync with the search state.
+    fn sync_loading(&mut self, status: &StatusBar, window: &mut Window, cx: &mut Context<Self>) {
         self.input
-            .update(cx, |state, cx| state.set_loading(loading, window, cx));
+            .update(cx, |state, cx| state.set_loading(status.is_running(), window, cx));
     }
 }
 
-// ── Render ────────────────────────────────────────────────────────────────────
-
 impl Render for SearchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_loading(window, cx);
-
         let query = self.query_text(cx);
-        let list_empty = self.list.read(cx).is_empty();
         let status = self.status_bar(cx);
-        // "↵ deep search" only when idle with results and no error.
-        let show_hint = matches!(status, StatusBar::Done(_)) && self.error.is_none();
         let muted = cx.theme().muted_foreground;
-        // Show the reference panel only when nothing has been typed yet.
-        let show_ref = list_empty && query.is_empty();
+
+        self.sync_loading(&status, window, cx);
 
         div()
             .key_context(KEY_CONTEXT)
@@ -208,7 +176,6 @@ impl Render for SearchView {
             .gap_2()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            // ── Search input ──────────────────────────────────────────────────
             .child({
                 let suffix_text: Option<SharedString> = self.hints.suffix_text().or_else(|| {
                     self.registry
@@ -228,15 +195,14 @@ impl Render for SearchView {
                         )
                     })
             })
-            // ── Main area: results list or quick reference ─────────────────────
             .child(Separator::horizontal())
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .when(!list_empty, |d| d.child(self.list.clone()))
-                    .when(show_ref, |d| {
+                    .when(status.has_results(), |d| d.child(self.list.clone()))
+                    .when(status.shows_quick_ref(), |d| {
                         let infos = self
                             .registry
                             .as_deref()
@@ -245,7 +211,6 @@ impl Render for SearchView {
                         d.child(quick_ref(muted, infos))
                     }),
             )
-            // ── Status bar ────────────────────────────────────────────────────
             .when(status.is_visible(), |d| {
                 d.child(Separator::horizontal()).child(
                     div()
@@ -264,15 +229,13 @@ impl Render for SearchView {
                                     d.child(div().text_sm().child(label))
                                 }),
                         )
-                        .when(show_hint, |d| {
+                        .when(status.shows_deep_search_hint(query.is_empty()), |d| {
                             d.child(div().text_sm().text_color(muted).child("↵ deep search"))
                         }),
                 )
             })
     }
 }
-
-// ── Quick reference ───────────────────────────────────────────────────────────
 
 /// Two-column row: muted label on the left, example on the right.
 fn ref_row(label: impl Into<SharedString>, example: impl Into<SharedString>, muted: Hsla) -> impl IntoElement {
@@ -291,7 +254,6 @@ fn ref_row(label: impl Into<SharedString>, example: impl Into<SharedString>, mut
         .child(div().text_sm().child(example.into()))
 }
 
-/// Thin horizontal separator with a little breathing room.
 fn ref_sep() -> impl IntoElement {
     div().py_1().child(Separator::horizontal())
 }
@@ -311,7 +273,6 @@ fn handler_label(info: &SxHandlerInfo) -> String {
     label
 }
 
-/// Build the example string for a handler row.
 /// Prefers `namespace:value_hint`, falls back to `description`, then `namespace:`.
 fn handler_example(info: &SxHandlerInfo) -> String {
     let ns = info.namespace.as_str();
@@ -326,10 +287,7 @@ fn handler_example(info: &SxHandlerInfo) -> String {
     }
 }
 
-/// Reference card shown in the idle state (empty query, no results).
-///
-/// Top: static file-filter cheat-sheet. Middle: one row per loaded plugin.
-/// Bottom: combinator syntax.
+/// Idle-state reference card: file-filter cheat-sheet + loaded plugins + combinators.
 fn quick_ref(muted: Hsla, handler_infos: Vec<SxHandlerInfo>) -> impl IntoElement {
     let mut el = div()
         .flex()
@@ -337,18 +295,16 @@ fn quick_ref(muted: Hsla, handler_infos: Vec<SxHandlerInfo>) -> impl IntoElement
         .gap_1()
         .px_4()
         .py_3()
-        // ── File & path filters ───────────────────────────────────────────────
         .child(ref_row("name: · n:", "n:main   n:!test", muted))
         .child(ref_row("path: · p:", "p:src   p:!vendor", muted))
         .child(ref_row("ext: · e:", "ext:rs,py   e:go", muted))
         .child(ref_row("type: · t:", "t:f   t:d   t:x   t:l", muted))
         .child(ref_row("hidden: · h:", "h:include   h:only", muted))
         .child(ref_row("size: · s:", "s:>10m   s:<1k", muted))
-        .child(ref_row("modified: · m:", "m:7d   m:today   m:>30d", muted))
+        .child(ref_row("modified: · m:", "m:7d   m:today   m:<30d", muted))
         .child(ref_row("content: · c:", "c:foo   c:!bar", muted))
         .child(ref_row("line: · l:", "l:foo   l:foo l:bar", muted));
 
-    // ── Loaded plugins ────────────────────────────────────────────────────────
     if !handler_infos.is_empty() {
         el = el.child(ref_sep());
         for info in &handler_infos {
@@ -356,15 +312,6 @@ fn quick_ref(muted: Hsla, handler_infos: Vec<SxHandlerInfo>) -> impl IntoElement
         }
     }
 
-    // ── Combinator syntax ─────────────────────────────────────────────────────
     el.child(ref_sep())
         .child(ref_row("combine:", "or(a,b,c)   not(a)   a b c  (AND)", muted))
-}
-
-// ── Runtime helper ────────────────────────────────────────────────────────────
-
-/// Thin wrapper so submodules write `super::runtime()` instead of reaching
-/// three levels up to the `gui` module.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    super::runtime()
 }

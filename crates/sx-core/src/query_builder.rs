@@ -1,111 +1,15 @@
 use crate::error::BuildError;
-use crate::query::{
+use sx_parser::{
     CaseSensitivity, FileType, Filter, HiddenMode, MatchExpr, MetaDepth, MetaFilter, MetaValue,
     Query, RangeExpr, SearchOptions, Timestamp,
 };
 use log::debug;
 use std::path::PathBuf;
-
-/// Which evaluation tier a filter leaf belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
-    Walk,
-    Content,
-    /// Combinator contains children from both tiers.
-    Mixed,
-}
-
-fn tier_of(f: &Filter) -> Tier {
-    match f {
-        // Walk-tier leaves
-        Filter::Name(_)
-        | Filter::Path(_)
-        | Filter::Hidden(_)
-        | Filter::Ext(_)
-        | Filter::Size(_)
-        | Filter::Modified(_)
-        | Filter::Created(_)
-        | Filter::Accessed(_)
-        | Filter::PermOctal(_)
-        | Filter::PermFlag(_)
-        | Filter::Owner(_)
-        | Filter::Group(_) => Tier::Walk,
-
-        // FileType: walk-tier variants only
-        Filter::Type(ft) => match ft {
-            FileType::File | FileType::Dir | FileType::Symlink | FileType::Empty => Tier::Walk,
-            FileType::Executable | FileType::Binary | FileType::Text => Tier::Content,
-        },
-
-        // Content-tier leaves
-        Filter::Content(_) | Filter::Line(_) | Filter::Mime(_) | Filter::Meta(_) => Tier::Content,
-
-        // Sentinel
-        Filter::Any => Tier::Walk,
-
-        // Combinators: derive from children
-        Filter::Not(inner) => tier_of(inner),
-        Filter::And(children) | Filter::Or(children) => {
-            let mut has_walk = false;
-            let mut has_content = false;
-            for c in children {
-                match tier_of(c) {
-                    Tier::Walk => has_walk = true,
-                    Tier::Content => has_content = true,
-                    Tier::Mixed => {
-                        has_walk = true;
-                        has_content = true;
-                    }
-                }
-            }
-            match (has_walk, has_content) {
-                (true, false) => Tier::Walk,
-                (false, true) => Tier::Content,
-                _ => Tier::Mixed,
-            }
-        }
-    }
-}
-
-/// Partition a filter into `(walk_part, content_part)`.
-/// `pub(crate)` so `parser.rs` can call it directly.
-pub(crate) fn partition(f: Filter) -> (Filter, Filter) {
-    // `And` nodes are split element-by-element in a single pass, without a
-    // prior `tier_of` traversal, to avoid walking the tree twice.
-    if let Filter::And(children) = f {
-        let mut walk_children = Vec::new();
-        let mut content_children = Vec::new();
-        for child in children {
-            let (w, c) = partition(child);
-            if w != Filter::Any {
-                walk_children.push(w);
-            }
-            if c != Filter::Any {
-                content_children.push(c);
-            }
-        }
-        let pack = |mut v: Vec<Filter>| match v.len() {
-            0 => Filter::Any,
-            1 => v.remove(0),
-            _ => Filter::And(v),
-        };
-        return (pack(walk_children), pack(content_children));
-    }
-
-    // For every other node a single `tier_of` pass is sufficient.
-    match tier_of(&f) {
-        Tier::Walk => (f, Filter::Any),
-        Tier::Content => (Filter::Any, f),
-        // Mixed Or and mixed Not go entirely to the content tier.
-        Tier::Mixed => (Filter::Any, f),
-    }
-}
+use sx_parser::partition;
 
 /// Walk `f` and return an error if any `Filter::Meta` node is present.
-///
 /// `meta:` filtering is not yet implemented — building a query with it would
-/// produce a silent always-pass at runtime.  Reject it here so callers get a
-/// clear `BuildError` instead.
+/// silently always-pass at runtime.
 fn reject_meta(f: &Filter) -> Result<(), BuildError> {
     match f {
         Filter::Meta(mf) => Err(BuildError::InvalidMetaTag {
@@ -123,11 +27,7 @@ fn reject_meta(f: &Filter) -> Result<(), BuildError> {
     }
 }
 
-// ── QueryBuilder ──────────────────────────────────────────────────────────────
-
-/// Typed, chainable builder for `Query`. Each method maps 1-to-1 to a
-/// `Filter` variant. Call `.build()` to partition the filter tree into
-/// `walk_filter` / `content_filter` and freeze into a `Query`.
+/// Chainable builder for [`Query`]. Call `.build()` to freeze into a `Query`.
 #[derive(Default)]
 pub struct QueryBuilder {
     roots: Vec<PathBuf>,
@@ -140,8 +40,6 @@ impl QueryBuilder {
         Self::default()
     }
 
-    // ── Roots ─────────────────────────────────────────────────────────────────
-
     pub fn root(mut self, path: impl Into<PathBuf>) -> Self {
         self.roots.push(path.into());
         self
@@ -151,8 +49,6 @@ impl QueryBuilder {
         self.roots.extend(paths.into_iter().map(Into::into));
         self
     }
-
-    // ── Filename ──────────────────────────────────────────────────────────────
 
     pub fn name(mut self, value: impl AsRef<[u8]>) -> Self {
         self.filters.push(Filter::Name(MatchExpr::exact(value)));
@@ -165,8 +61,6 @@ impl QueryBuilder {
         self
     }
 
-    // ── Full path ─────────────────────────────────────────────────────────────
-
     pub fn path(mut self, value: impl AsRef<[u8]>) -> Self {
         self.filters.push(Filter::Path(MatchExpr::exact(value)));
         self
@@ -178,14 +72,10 @@ impl QueryBuilder {
         self
     }
 
-    // ── Hidden ────────────────────────────────────────────────────────────────
-
     pub fn hidden(mut self, mode: HiddenMode) -> Self {
         self.filters.push(Filter::Hidden(mode));
         self
     }
-
-    // ── Extension ─────────────────────────────────────────────────────────────
 
     pub fn ext(mut self, exts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Self {
         let list: Vec<Box<[u8]>> = exts.into_iter().map(|e| Box::from(e.as_ref())).collect();
@@ -198,8 +88,6 @@ impl QueryBuilder {
         self.filters.push(Filter::Not(Box::new(Filter::Ext(list))));
         self
     }
-
-    // ── Content ───────────────────────────────────────────────────────────────
 
     pub fn content(mut self, value: impl AsRef<[u8]>) -> Self {
         self.filters.push(Filter::Content(MatchExpr::exact(value)));
@@ -216,8 +104,6 @@ impl QueryBuilder {
         self.filters.push(Filter::Line(MatchExpr::exact(value)));
         self
     }
-
-    // ── Size ──────────────────────────────────────────────────────────────────
 
     pub fn size_gt(mut self, bytes: u64) -> Self {
         self.filters.push(Filter::Size(RangeExpr::Gt(bytes)));
@@ -239,8 +125,6 @@ impl QueryBuilder {
             .push(Filter::Size(RangeExpr::Between(min_bytes, max_bytes)));
         self
     }
-
-    // ── Timestamps ────────────────────────────────────────────────────────────
 
     pub fn modified_after(mut self, ts: Timestamp) -> Self {
         self.filters.push(Filter::Modified(RangeExpr::Gt(ts)));
@@ -278,27 +162,20 @@ impl QueryBuilder {
         self
     }
 
-    // ── File type ─────────────────────────────────────────────────────────────
-
     pub fn file_type(mut self, t: FileType) -> Self {
         self.filters.push(Filter::Type(t));
         self
     }
-
-    // ── MIME ──────────────────────────────────────────────────────────────────
 
     pub fn mime(mut self, value: impl AsRef<[u8]>) -> Self {
         self.filters.push(Filter::Mime(MatchExpr::exact(value)));
         self
     }
 
-    // ── Permissions ───────────────────────────────────────────────────────────
-
     /// Exact-match permission bits. `octal` is an octal string, e.g. `"644"`.
     ///
-    /// Returns `Err(BuildError::InvalidPermOctal)` if `octal` is not a valid
-    /// octal number.  For pre-parsed values use `Filter::PermOctal(v)` directly
-    /// via [`and_filter`](Self::and_filter).
+    /// Returns `Err(BuildError::InvalidPermOctal)` if `octal` is not valid.
+    /// For pre-parsed values use `Filter::PermOctal(v)` via [`and_filter`](Self::and_filter).
     pub fn try_perm_octal(mut self, octal: &str) -> Result<Self, BuildError> {
         let v = u32::from_str_radix(octal, 8).map_err(|e| BuildError::InvalidPermOctal {
             value: octal.to_owned(),
@@ -314,8 +191,6 @@ impl QueryBuilder {
         self
     }
 
-    // ── Ownership ─────────────────────────────────────────────────────────────
-
     pub fn owner(mut self, name_or_uid: impl AsRef<[u8]>) -> Self {
         self.filters
             .push(Filter::Owner(MatchExpr::exact(name_or_uid)));
@@ -327,8 +202,6 @@ impl QueryBuilder {
             .push(Filter::Group(MatchExpr::exact(name_or_gid)));
         self
     }
-
-    // ── Metadata ──────────────────────────────────────────────────────────────
 
     pub fn meta_text(mut self, tag: impl AsRef<[u8]>, expr: MatchExpr) -> Self {
         self.filters.push(Filter::Meta(MetaFilter {
@@ -370,27 +243,22 @@ impl QueryBuilder {
         self
     }
 
-    // ── Logic combinators ─────────────────────────────────────────────────────
-
     /// Push a pre-built `Filter` subtree, AND'd with everything else.
     pub fn and_filter(mut self, f: Filter) -> Self {
         self.filters.push(f);
         self
     }
 
-    /// Combine the **last** accumulated filter with `f` in an `Or`.
+    /// OR the **last** accumulated filter with `f`.
     ///
-    /// **Order matters.** This method modifies only the previously pushed
-    /// filter, not the whole accumulated list.  For example:
+    /// Only the previously pushed filter is OR'd, not the whole list:
     ///
     /// ```text
     /// builder.name("foo").size_gt(1024).or_filter(Filter::Name(...("bar")))
     /// //  => And(Name("foo"),  Or(Size(>1024),  Name("bar")))
-    /// //                       ^ only this part is OR'd
     /// ```
     ///
-    /// To OR an entire compound expression, build the `Filter` manually and
-    /// push it with [`and_filter`](Self::and_filter).
+    /// To OR a compound expression, build the `Filter` manually and use [`and_filter`](Self::and_filter).
     pub fn or_filter(mut self, f: Filter) -> Self {
         if let Some(last) = self.filters.pop() {
             self.filters.push(Filter::Or(vec![last, f]));
@@ -400,18 +268,13 @@ impl QueryBuilder {
         self
     }
 
-    /// Negate the **last** accumulated filter by wrapping it in `Not`.
-    ///
-    /// Same ordering caveat as [`or_filter`](Self::or_filter): only the
-    /// previously pushed filter is negated.
+    /// Negate the **last** accumulated filter.
     pub fn not_last(mut self) -> Self {
         if let Some(last) = self.filters.pop() {
             self.filters.push(Filter::Not(Box::new(last)));
         }
         self
     }
-
-    // ── Options ───────────────────────────────────────────────────────────────
 
     pub fn depth(mut self, max: usize) -> Self {
         self.options.depth = Some(max);
@@ -443,10 +306,7 @@ impl QueryBuilder {
         self
     }
 
-    // ── Build ─────────────────────────────────────────────────────────────────
-
-    /// Partition the accumulated filters into `walk_filter` / `content_filter`
-    /// and freeze into an immutable `Query`.
+    /// Partition filters into `walk_filter` / `content_filter` and freeze into a [`Query`].
     ///
     /// Returns `BuildError::NoRootsProvided` if no roots were set.
     pub fn build(self) -> Result<Query, BuildError> {
@@ -456,6 +316,7 @@ impl QueryBuilder {
 
         let filters = self.filters;
         let n_filters = filters.len();
+
         let combined = match filters.len() {
             0 => Filter::Any,
             1 => filters.into_iter().next().unwrap(),
@@ -487,6 +348,7 @@ impl QueryBuilder {
             content_filter,
             options: self.options,
             handler_tokens: vec![],
+            raw_query: String::new(), // QueryBuilder has no raw string; plugins get "" for programmatic queries
         })
     }
 }

@@ -191,12 +191,6 @@ fn extract_path(path: &[u8]) -> SxExtractOutput {
 
 pub struct TextHandler;
 
-impl TextHandler {
-    pub fn init_logger() {
-        let _ = env_logger::try_init();
-    }
-}
-
 impl sx_plugin_api::SxHandler for TextHandler {
     extern "C" fn info(&self) -> SxHandlerInfo {
         let mut file_extensions = stabby::vec::Vec::new();
@@ -219,6 +213,7 @@ impl sx_plugin_api::SxHandler for TextHandler {
             file_extensions_optional,
             namespace_policy: SxNamespacePolicy::Exclusive,
             global_scope: false,
+            is_file_index: false,
         }
     }
 

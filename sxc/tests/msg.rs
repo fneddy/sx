@@ -1,6 +1,6 @@
 //! Integration tests for `ResultMsg: From<SxResult>`.
 
-use sx_plugin_api::{meta_icon_png, SxResult};
+use sx_plugin_api::{SxMetaEntry, SxResult};
 use sxc::shared::msg::{MetaValue, ResultMsg};
 
 #[test]
@@ -18,7 +18,7 @@ fn result_to_msg_text_metadata() {
 fn result_to_msg_icon_png_stored_as_bytes() {
     let mut res = SxResult::new("apps", 1.0);
     res.title = sx_plugin_api::stabby::option::Option::Some(sx_plugin_api::SxBytes::from_str_bytes("Firefox"));
-    meta_icon_png(&mut res, vec![1, 2, 3]);
+    res.metadata.push(SxMetaEntry::bytes("icon_png", vec![1, 2, 3]));
     let r: ResultMsg = res.into();
     assert_eq!(r.namespace, "apps");
     assert_eq!(r.title.as_deref(), Some("Firefox"));
@@ -62,16 +62,7 @@ fn meta_value_types_are_distinct() {
     res.metadata
         .push(sx_plugin_api::SxMetaEntry::bytes("k_bytes", vec![0xff]));
     let r: ResultMsg = res.into();
-    assert!(matches!(
-        &r.metadata.iter().find(|e| e.key == "k_text").unwrap().value,
-        MetaValue::Text(_)
-    ));
-    assert!(matches!(
-        &r.metadata.iter().find(|e| e.key == "k_num").unwrap().value,
-        MetaValue::Number(_)
-    ));
-    assert!(matches!(
-        &r.metadata.iter().find(|e| e.key == "k_bytes").unwrap().value,
-        MetaValue::Bytes(_)
-    ));
+    assert!(matches!(r.metadata.get("k_text").unwrap(), MetaValue::Text(_)));
+    assert!(matches!(r.metadata.get("k_num").unwrap(), MetaValue::Number(_)));
+    assert!(matches!(r.metadata.get("k_bytes").unwrap(), MetaValue::Bytes(_)));
 }

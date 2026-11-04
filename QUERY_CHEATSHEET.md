@@ -50,7 +50,7 @@ Match anywhere in the full path.
 ```
 path:src/tests
 p:!vendor
-p:/home/eddy/docs   # absolute path → used as the search root
+p:/home/eddy/docs   # absolute path → added as a search root (alongside the current directory)
 ```
 
 ### `ext:` · `e:`  — file extension
@@ -125,16 +125,16 @@ Three namespaces with identical syntax:
 | `Nd` / `Nw` / `Nm` / `Ny` | `7d` `2w` `3m` `1y` | Within the last N days/weeks/months/years |
 | `today` | `today` | During today |
 | `YYYY-MM-DD` | `2024-06-15` | During that calendar day |
-| `>…` / `<…` / `=…` | `>30d` `<2024-01-01` | Explicit comparison |
+| `>…` / `<…` / `=…` | `>30d` `<2024-01-01` | Explicit comparison — `>` means the file timestamp is **more recent than** the reference point; `<` means **older than** |
 
-Without an explicit `>/<` prefix, a relative value means "more recent than":
+Without an explicit `>/<` prefix, a relative value means "more recent than" (same as `>`):
 
 ```
 m:7d              # modified in the last 7 days
 mod:today
 modified:2024-06-15
-m:>30d            # NOT modified in the last 30 days
-ac:<1w            # accessed less than 1 week ago
+m:<30d            # NOT modified in the last 30 days (older than 30 days)
+ac:>1w            # accessed less than 1 week ago (more recent than 1 week ago)
 ```
 
 ---
@@ -304,7 +304,7 @@ TYPE        t:f  t:d  t:l  t:e  t:x  t:b  t:t
 HIDDEN      h:include  h:exclude  h:only
 
 SIZE        s:>10m  s:<1k  s:1.5m  s:0
-MODIFIED    m:7d  m:today  m:2024-06-15  m:>30d
+MODIFIED    m:7d  m:today  m:2024-06-15  m:<30d
 CREATED     cr:7d  cr:today
 ACCESSED    ac:1w  ac:today
 

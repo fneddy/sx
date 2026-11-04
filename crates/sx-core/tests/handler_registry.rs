@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use sx_core::HandlerRegistry;
 use sx_plugin_api::{
-    stabby, SxBytes, SxHandlerInfo, SxNamespacePolicy, SxQueryContext, SxResult, SxResultSender,
+    stabby, SxBytes, SxHandlerInfo, SxMetaEntry, SxNamespacePolicy, SxQueryContext, SxResult,
+    SxResultSender,
 };
 
 // ── MockHandler ───────────────────────────────────────────────────────────────
@@ -64,10 +65,12 @@ impl sx_plugin_api::SxHandler for MockHandler {
             namespace: SxBytes::from_str_bytes(self.namespace),
             aliases,
             description: SxBytes::from_str_bytes("test handler"),
+            value_hint: SxBytes::from_str_bytes(""),
             file_extensions,
             file_extensions_optional,
             namespace_policy: self.policy.clone(),
             global_scope: false,
+            is_file_index: false,
         }
     }
 
@@ -77,9 +80,8 @@ impl sx_plugin_api::SxHandler for MockHandler {
         _ctx: &SxQueryContext,
         sender: SxResultSender,
     ) {
-        use sx_plugin_api::meta_text;
         let mut result = SxResult::new(self.namespace, 1.0);
-        meta_text(&mut result, "value", value.as_ref());
+        result.metadata.push(SxMetaEntry::text("value", value.as_ref()));
         sender.send(result);
     }
 
@@ -87,6 +89,13 @@ impl sx_plugin_api::SxHandler for MockHandler {
         &self,
     ) -> stabby::option::Option<sx_plugin_api::SxExtractorHandle> {
         stabby::option::Option::None()
+    }
+
+    extern "C" fn hints(
+        &self,
+        _partial_value: stabby::str::Str<'_>,
+    ) -> sx_plugin_api::SxHints {
+        sx_plugin_api::SxHints::empty()
     }
 }
 
