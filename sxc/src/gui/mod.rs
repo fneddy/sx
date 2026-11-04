@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use gpui::prelude::*;
-use gpui::{px, size, App, Focusable, KeyBinding, WindowBounds, WindowOptions};
+use gpui::{
+    layer_shell::{KeyboardInteractivity, Layer, LayerShellOptions},
+    px, size, App, Focusable, KeyBinding, WindowBounds, WindowKind, WindowOptions,
+};
 use gpui_kit::component::theme::{Theme, ThemeMode as KitThemeMode};
 
 use crate::shared::config::ThemeMode;
@@ -75,16 +78,54 @@ pub fn run(plugin_dirs: Vec<PathBuf>, root: PathBuf, theme_mode: ThemeMode) {
             KeyBinding::new("tab", AcceptHint, Some(KEY_CONTEXT)),
         ]);
 
-        let opts = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(660.), px(600.)), cx)),
-            app_id: Some("sxp".to_string()),
+        // Prefer layer-shell (zwlr_layer_shell_v1): launchers opened this way are
+        // always floating and get proper alpha on every Wayland compositor that
+        // supports it (niri, sway, river, wlroots-based, …).
+        // Fall back to a plain window on compositors that don't implement the
+        // protocol (GNOME/Mutter, etc.).
+        let window_bounds = Some(WindowBounds::centered(size(px(660.), px(600.)), cx));
+        let app_id = Some("sxp".to_string());
+
+        let layer_opts = WindowOptions {
+            window_bounds,
+            app_id: app_id.clone(),
+            kind: WindowKind::LayerShell(LayerShellOptions {
+                namespace: "sxp".to_string(),
+                layer: Layer::Overlay,
+                anchor: gpui::layer_shell::Anchor::empty(), // centred on screen
+                exclusive_zone: None,
+                exclusive_edge: None,
+                margin: None,
+                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            }),
             ..Default::default()
         };
 
-        gpui_kit::open_window(opts, cx, move |window, cx| {
-            cx.new(|cx| SearchView::new(registry_rx, root, window, cx))
-        })
-        .expect("sxp: failed to open window");
+        let base_opts = WindowOptions {
+            window_bounds,
+            app_id,
+            ..Default::default()
+        };
+
+        // Try layer-shell first. open_window returns Err immediately (before the
+        // closure runs) if the compositor doesn't support the protocol, so we can
+        // safely fall through and open a plain window with the same values.
+        let mut registry_rx = Some(registry_rx);
+        let root_clone = root.clone();
+
+        let opened = gpui_kit::open_window(layer_opts, cx, |window, cx| {
+            cx.new(|cx| SearchView::new(registry_rx.take().unwrap(), root.clone(), window, cx))
+        });
+
+        if opened.is_err() {
+            log::info!("sxp: compositor has no zwlr_layer_shell_v1, falling back to normal window");
+            gpui_kit::open_window(base_opts, cx, move |window, cx| {
+                cx.new(|cx| {
+                    SearchView::new(registry_rx.take().unwrap(), root_clone, window, cx)
+                })
+            })
+            .expect("sxp: failed to open window");
+        }
 
         cx.activate(true);
     });
