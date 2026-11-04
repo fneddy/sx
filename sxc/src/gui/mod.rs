@@ -76,7 +76,7 @@ pub fn run(plugin_dirs: Vec<PathBuf>, root: PathBuf, theme_mode: ThemeMode) {
         ]);
 
         let opts = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(660.), px(100.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(660.), px(600.)), cx)),
             app_id: Some("sxp".to_string()),
             ..Default::default()
         };

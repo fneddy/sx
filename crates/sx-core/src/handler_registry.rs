@@ -211,6 +211,12 @@ impl HandlerRegistry {
         self.index.contains_key(ns)
     }
 
+    /// Returns a snapshot of `SxHandlerInfo` for every registered handler,
+    /// in registration order.  Used by the UI to build the quick-reference panel.
+    pub fn handlers_info(&self) -> Vec<SxHandlerInfo> {
+        self.handlers.iter().map(|h| h.info()).collect()
+    }
+
     /// Returns all registered namespace strings.
     /// Used by the UI for namespace-prefix tab-completion.
     pub fn namespaces(&self) -> Vec<String> {

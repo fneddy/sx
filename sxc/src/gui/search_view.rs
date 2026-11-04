@@ -18,8 +18,8 @@ use tokio_util::sync::DropGuard;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, App, Context, Entity, FocusHandle, Focusable, IntoElement, Keystroke, Render,
-    SharedString, Subscription, Task, Window,
+    actions, div, App, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, Keystroke,
+    Render, SharedString, Subscription, Task, Window,
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -28,6 +28,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 
 use sx_core::HandlerRegistry;
+use sx_plugin_api::SxHandlerInfo;
 
 use crate::shared::msg::ResultMsg;
 use crate::shared::search::SearchHandle;
@@ -77,11 +78,6 @@ pub struct SearchView {
     _subscriptions: Vec<Subscription>,
     error: Option<SharedString>,
 
-    /// Viewport size captured at window-open; used as the collapsed (input-only) size.
-    collapsed_size: gpui::Size<gpui::Pixels>,
-    /// Tracks the last applied expanded/collapsed state to skip redundant resizes.
-    expanded: Option<bool>,
-
     hints: HintState,
 }
 
@@ -109,9 +105,6 @@ impl SearchView {
                 this.start_live_search(cx);
             }
         });
-
-        // Capture the initial viewport as the collapsed height before any resize.
-        let collapsed_size = window.viewport_size();
 
         // Focus the input immediately so the user can type without clicking.
         input.update(cx, |state, cx| state.focus(window, cx));
@@ -153,8 +146,6 @@ impl SearchView {
             _loader_task: Some(loader_task),
             _subscriptions: vec![input_sub],
             error: None,
-            collapsed_size,
-            expanded: None,
             hints: HintState::new(),
         }
     }
@@ -178,40 +169,6 @@ impl Focusable for SearchView {
     }
 }
 
-// ── Geometry ──────────────────────────────────────────────────────────────────
-
-impl SearchView {
-    /// Resize the window between collapsed (input-bar only) and expanded
-    /// (input + list + status bar) heights whenever the desired state changes.
-    ///
-    /// Called at the top of `render` before the element tree is built.
-    /// Mutates only `self.expanded` (a render-tracking field) and calls
-    /// `window.resize`.  Does **not** call `cx.notify()` to avoid a re-render loop.
-    fn sync_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let list_empty = self.list.read(cx).is_empty();
-        let status = self.status_bar(cx);
-        let wants_expanded = !list_empty || status.is_visible() || !self.hints.is_empty();
-
-        if self.expanded == Some(wants_expanded) {
-            return;
-        }
-        self.expanded = Some(wants_expanded);
-
-        if wants_expanded {
-            let h = self.collapsed_size.height * 6.0;
-            log::debug!("sxp: resize → expand {}×{}", self.collapsed_size.width, h);
-            window.resize(gpui::size(self.collapsed_size.width, h));
-        } else {
-            log::debug!(
-                "sxp: resize → collapse {}×{}",
-                self.collapsed_size.width,
-                self.collapsed_size.height,
-            );
-            window.resize(self.collapsed_size);
-        }
-    }
-}
-
 impl SearchView {
     fn sync_loading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let loading = self.status_bar(cx).is_running();
@@ -224,14 +181,16 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_geometry(window, cx);
         self.sync_loading(window, cx);
 
+        let query = self.query_text(cx);
         let list_empty = self.list.read(cx).is_empty();
         let status = self.status_bar(cx);
         // "↵ deep search" only when idle with results and no error.
         let show_hint = matches!(status, StatusBar::Done(_)) && self.error.is_none();
         let muted = cx.theme().muted_foreground;
+        // Show the reference panel only when nothing has been typed yet.
+        let show_ref = list_empty && query.is_empty();
 
         div()
             .key_context(KEY_CONTEXT)
@@ -251,7 +210,6 @@ impl Render for SearchView {
             .text_color(cx.theme().foreground)
             // ── Search input ──────────────────────────────────────────────────
             .child({
-                let query = self.query_text(cx);
                 let suffix_text: Option<SharedString> = self.hints.suffix_text().or_else(|| {
                     self.registry
                         .as_deref()
@@ -270,16 +228,23 @@ impl Render for SearchView {
                         )
                     })
             })
-            // ── Result list ───────────────────────────────────────────────────
-            .when(!list_empty, |d| {
-                d.child(Separator::horizontal()).child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(self.list.clone()),
-                )
-            })
+            // ── Main area: results list or quick reference ─────────────────────
+            .child(Separator::horizontal())
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .when(!list_empty, |d| d.child(self.list.clone()))
+                    .when(show_ref, |d| {
+                        let infos = self
+                            .registry
+                            .as_deref()
+                            .map(|r| r.handlers_info())
+                            .unwrap_or_default();
+                        d.child(quick_ref(muted, infos))
+                    }),
+            )
             // ── Status bar ────────────────────────────────────────────────────
             .when(status.is_visible(), |d| {
                 d.child(Separator::horizontal()).child(
@@ -305,6 +270,95 @@ impl Render for SearchView {
                 )
             })
     }
+}
+
+// ── Quick reference ───────────────────────────────────────────────────────────
+
+/// Two-column row: muted label on the left, example on the right.
+fn ref_row(label: impl Into<SharedString>, example: impl Into<SharedString>, muted: Hsla) -> impl IntoElement {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_3()
+        .child(
+            div()
+                .text_sm()
+                .text_color(muted)
+                .flex_none()
+                .w_40()
+                .child(label.into()),
+        )
+        .child(div().text_sm().child(example.into()))
+}
+
+/// Thin horizontal separator with a little breathing room.
+fn ref_sep() -> impl IntoElement {
+    div().py_1().child(Separator::horizontal())
+}
+
+/// Build the label string for a handler row: `"ns: · alias:"`.
+fn handler_label(info: &SxHandlerInfo) -> String {
+    let mut label = info.namespace.as_str().to_owned();
+    for alias in info.aliases.as_slice() {
+        let a = alias.as_str();
+        if !a.is_empty() {
+            label.push_str(" · ");
+            label.push_str(a);
+            label.push(':');
+        }
+    }
+    label.push(':');
+    label
+}
+
+/// Build the example string for a handler row.
+/// Prefers `namespace:value_hint`, falls back to `description`, then `namespace:`.
+fn handler_example(info: &SxHandlerInfo) -> String {
+    let ns = info.namespace.as_str();
+    let hint = info.value_hint.as_str();
+    let desc = info.description.as_str();
+    if !hint.is_empty() {
+        format!("{ns}:{hint}")
+    } else if !desc.is_empty() {
+        desc.to_owned()
+    } else {
+        format!("{ns}:")
+    }
+}
+
+/// Reference card shown in the idle state (empty query, no results).
+///
+/// Top: static file-filter cheat-sheet. Middle: one row per loaded plugin.
+/// Bottom: combinator syntax.
+fn quick_ref(muted: Hsla, handler_infos: Vec<SxHandlerInfo>) -> impl IntoElement {
+    let mut el = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_4()
+        .py_3()
+        // ── File & path filters ───────────────────────────────────────────────
+        .child(ref_row("name: · n:", "n:main   n:!test", muted))
+        .child(ref_row("path: · p:", "p:src   p:!vendor", muted))
+        .child(ref_row("ext: · e:", "ext:rs,py   e:go", muted))
+        .child(ref_row("type: · t:", "t:f   t:d   t:x   t:l", muted))
+        .child(ref_row("hidden: · h:", "h:include   h:only", muted))
+        .child(ref_row("size: · s:", "s:>10m   s:<1k", muted))
+        .child(ref_row("modified: · m:", "m:7d   m:today   m:>30d", muted))
+        .child(ref_row("content: · c:", "c:foo   c:!bar", muted))
+        .child(ref_row("line: · l:", "l:foo   l:foo l:bar", muted));
+
+    // ── Loaded plugins ────────────────────────────────────────────────────────
+    if !handler_infos.is_empty() {
+        el = el.child(ref_sep());
+        for info in &handler_infos {
+            el = el.child(ref_row(handler_label(info), handler_example(info), muted));
+        }
+    }
+
+    // ── Combinator syntax ─────────────────────────────────────────────────────
+    el.child(ref_sep())
+        .child(ref_row("combine:", "or(a,b,c)   not(a)   a b c  (AND)", muted))
 }
 
 // ── Runtime helper ────────────────────────────────────────────────────────────
