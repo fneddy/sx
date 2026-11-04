@@ -16,7 +16,6 @@ check liblzma
 check openssl
 check tracker-sparql-3.0
 check gtk4
-check gtk4-layer-shell-0
 check gdk-pixbuf-2.0
 check pango
 check cairo
@@ -29,8 +28,9 @@ check xkbcommon-x11
 if [ -n "$MISSING" ]; then
     echo "Missing pkg-config packages:$MISSING"
     echo ""
-    echo "Fedora:  sudo dnf install glib2-devel xz-devel openssl-devel tinysparql-devel gtk4-devel gtk4-layer-shell-devel gdk-pixbuf2-devel pango-devel cairo-devel harfbuzz-devel fontconfig-devel freetype-devel libxkbcommon-devel libxkbcommon-x11-devel"
-    echo "Debian:  sudo apt-get install libglib2.0-dev liblzma-dev libssl-dev libtracker-sparql-3.0-dev libgtk-4-dev libgtk4-layer-shell-dev libgdk-pixbuf2.0-dev libpango1.0-dev libcairo2-dev libharfbuzz-dev libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev"
+    echo "Fedora:  sudo dnf install glib2-devel xz-devel openssl-devel tinysparql-devel gtk4-devel gdk-pixbuf2-devel pango-devel cairo-devel harfbuzz-devel fontconfig-devel freetype-devel libxkbcommon-devel libxkbcommon-x11-devel"
+    echo "Debian:  sudo apt-get install libglib2.0-dev liblzma-dev libssl-dev libtracker-sparql-3.0-dev libgtk-4-dev libgdk-pixbuf2.0-dev libpango1.0-dev libcairo2-dev libharfbuzz-dev libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev"
+    echo "Arch:    sudo pacman -S glib2 xz openssl tinysparql gtk4 gdk-pixbuf2 pango cairo harfbuzz fontconfig freetype2 libxkbcommon"
     exit 1
 fi
 
